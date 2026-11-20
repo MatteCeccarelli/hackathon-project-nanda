@@ -431,6 +431,8 @@ def _our_rx(chat: list[Message], agent: str) -> dict[str, str]:
 async def _gp(city: City, message: Message, chat: list[Message]) -> None:
     agent = city.agent_id
     if message.sender == LEDGER:
+        if await _gp_renew_on_ledger(city, message, chat):
+            return
         await _announce(city, message, chat, agent)
         return
     if not message.sender.startswith("citizen:"):
@@ -441,6 +443,12 @@ async def _gp(city: City, message: Message, chat: list[Message]) -> None:
         return
     code = _symptom(message)
     if code is None:
+        # Rinnovo (regola P1): il cittadino torna con solo il numero della ricetta scaduta.
+        old = fields_of(message.text).get("prescription_number") or str(
+            understood(message).body.get("prescription_number") or ""
+        )
+        if old:
+            await _gp_renew(city, message, chat, old)
         return
     procedure, priority = _PROTOCOLS[code]
     number = _rx(message.need_id, message.msg_id)
@@ -466,6 +474,107 @@ async def _gp(city: City, message: Message, chat: list[Message]) -> None:
         return
 
     await _say(city, message.sender, f"{act}\n{line}" if line else act)
+
+
+# --- GP: rinnovo di una ricetta scaduta (regola P1) ---------------------------------------
+
+
+def _renewed_number(old: str, need_id: str | None, msg_id: str) -> str:
+    """Numero nuovo e diverso dal vecchio: ...-R1, ...-R2, ... (formato del Ledger)."""
+    found = re.search(r"-R(\d+)$", old)
+    base = old[: found.start()] if found else old
+    step = int(found.group(1)) + 1 if found else 1
+    number = f"{base}-R{step}"
+    if _RX.fullmatch(number):
+        return number
+    fallback = _rx(need_id, msg_id)
+    return f"{fallback[:-3]}-R{step}" if _RX.fullmatch(f"{fallback[:-3]}-R{step}") else fallback
+
+
+def _rx_line(chat: list[Message], number: str) -> dict[str, str] | None:
+    for row in reversed(chat):
+        if (
+            row.sender == LEDGER
+            and first_word(row.text) == "prescription"
+            and f"prescription_number={number}" in row.text.split()
+        ):
+            return fields_of(row.text)
+    return None
+
+
+async def _gp_renew_on_ledger(city: City, message: Message, chat: list[Message]) -> bool:
+    """Risposta del Ledger arrivata in un turno a parte: riprende il rinnovo in sospeso."""
+    head = first_word(message.text)
+    if head not in {"prescription", "refused"}:
+        return False
+    for row in reversed(chat):
+        if not row.sender.startswith("citizen:"):
+            continue
+        if _symptom(row) is not None or _emergency(row):
+            return False
+        old = fields_of(row.text).get("prescription_number", "")
+        if old and old in message.text:
+            await _gp_renew(city, row, chat, old)
+            return True
+        return False
+    return False
+
+
+async def _gp_renew(city: City, message: Message, chat: list[Message], old: str) -> None:
+    """Rinnova la ricetta: stessa riga di protocollo, numero nuovo, Ledger prima del cittadino."""
+    agent = city.agent_id
+    citizen = message.sender
+    new = _renewed_number(old, message.need_id, message.msg_id)
+    token = f"prescription_number={new}"
+    if _we(chat, agent, token, to=citizen, word="prescription"):
+        return
+    rx = _rx_line(chat, old)
+    if rx is None or not rx.get("procedure"):
+        ask = f"prescription prescription_number={old}"
+        if not _exact(chat, agent, ask):
+            await _say(city, LEDGER, ask)
+        chat = await _until(
+            city, message.need_id, chat,
+            lambda rows: (_rx_line(rows, old) or {}).get("procedure") is not None,
+        )
+        rx = _rx_line(chat, old)
+    if rx is None or not rx.get("procedure"):
+        refused = any(
+            row.sender == LEDGER and first_word(row.text) == "refused" and old in row.text
+            for row in chat
+        )
+        if not refused:
+            # Il Ledger non ha ancora risposto: la sua risposta aprira' un nuovo turno
+            # (_gp -> _gp_renew_on_ledger) e il rinnovo partira' allora.
+            _LOG.info("gp.renew.waiting %s", old[:60])
+            return
+        _LOG.info("gp.renew.unknown %s", old[:60])
+        note = (
+            "I cannot read this prescription right now: please tell me your symptom so I can "
+            "issue a new one."
+            if _EN_HINT.search(message.text or "")
+            else "Non riesco a leggere questa ricetta in questo momento: mi dica il sintomo e "
+            "gliene emetto una nuova."
+        )
+        await _say(city, citizen, note)
+        return
+    code = rx.get("symptom_code", "")
+    if code in _PROTOCOLS:
+        procedure, priority = _PROTOCOLS[code]  # sempre la riga di protocollo
+    else:
+        procedure, priority = rx["procedure"], rx.get("priority", "")
+    if not priority:
+        return
+    act = f"prescription {token} procedure={procedure} priority={priority}"
+    line = await _gp_courtesy(city, message, procedure, priority)
+    if not _we(chat, agent, token, to=LEDGER, word="prescribe"):
+        parts = [f"prescribe patient={citizen} procedure={procedure} priority={priority}"]
+        if code:
+            parts.append(f"symptom_code={code}")
+        parts.append(token)
+        if not await _say(city, LEDGER, " ".join(parts)):
+            return
+    await _say(city, citizen, f"{act}\n{line}" if line else act)
 
 
 # --- GP courtesy line (review: proactivity, tone) -----------------------------------------
