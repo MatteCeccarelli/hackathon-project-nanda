@@ -1,4 +1,4 @@
-agent_id: agent:cdcmcpdynswm
+agent_id: agent:geyjmp26tajh
 team: team:t-5-gin-tokens
 name: booking_centre
 version: 1.0.0
@@ -12,4 +12,4 @@ capabilities:
   # - # TODO: assign capabilities to the agent
 no_clinical_advice: true
 endpoints:
-  mailbox: agent:cdcmcpdynswm
+  mailbox: agent:geyjmp26tajh
