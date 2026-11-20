@@ -1,0 +1,15 @@
+agent_id: agent:cgj1c2mf1dx0
+team: team:t-5-gin-tokens
+name: specialist
+version: 1.0.1
+cap_versions:
+  - "1.0"
+profiles:
+  - mhm/1.0
+role: facility
+capabilities:
+  - specialist_care.cardiology
+  # - # TODO: assign capabilities to the agent
+no_clinical_advice: true
+endpoints:
+  mailbox: agent:cgj1c2mf1dx0
