@@ -445,6 +445,11 @@ async def _gp(city: City, message: Message, chat: list[Message]) -> None:
     procedure, priority = _PROTOCOLS[code]
     number = _rx(message.need_id, message.msg_id)
     token = f"prescription_number={number}"
+
+    # Generate the courtesy line via LLM Gateway FIRST, so no Ledger race condition can preempt it
+    act = f"prescription {token} procedure={procedure} priority={priority}"
+    line = await _gp_courtesy(city, message, procedure, priority)
+
     # The citizen's reply window closes before a ledger round trip comes back, so the
     # prescription is said in this same turn. The ledger write is what the judge reads.
     if not _we(chat, agent, token, to=LEDGER, word="prescribe"):
@@ -460,10 +465,6 @@ async def _gp(city: City, message: Message, chat: list[Message]) -> None:
     if _we(chat, agent, token, to=message.sender, word="prescription"):
         return
 
-    # The act and its tokens stay exactly as before and come FIRST: the citizen and the
-    # judge read them. The courtesy line goes on the next line and never carries tokens.
-    act = f"prescription {token} procedure={procedure} priority={priority}"
-    line = await _gp_courtesy(city, message, procedure, priority)
     await _say(city, message.sender, f"{act}\n{line}" if line else act)
 
 
@@ -586,7 +587,8 @@ async def _announce(city: City, message: Message, chat: list[Message], agent: st
         parts.append(f"procedure={procedure}")
     if priority:
         parts.append(f"priority={priority}")
-    await _say(city, citizen, " ".join(parts))
+    fallback = _gp_fallback(False, procedure or "", priority or "")
+    await _say(city, citizen, f"{' '.join(parts)}\n{fallback}" if fallback else " ".join(parts))
 
 
 # --- centro prenotazioni and consultorio -------------------------------------------------------
