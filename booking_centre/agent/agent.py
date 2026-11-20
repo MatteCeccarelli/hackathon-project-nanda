@@ -320,8 +320,22 @@ def _has_agenda(chat: list[Message]) -> bool:
     return _when("" if agenda is None else agenda.get("agenda_now", "")) is not None
 
 
+def _rx_reply(chat: list[Message]) -> dict[str, str] | None:
+    """Risposta del Ledger sulla ricetta ATTUALE del cittadino (dopo un rinnovo cambia numero)."""
+    number = _number(chat)
+    rows = [row for row in chat if row.sender == LEDGER and first_word(row.text) == "prescription"]
+    if not number:
+        return fields_of(rows[-1].text) if rows else None
+    matching = [row for row in rows if f"prescription_number={number}" in row.text.split()]
+    if matching:
+        return fields_of(matching[-1].text)
+    if any("prescription_number=" in row.text for row in rows):
+        return None  # il Ledger ha risposto solo per ricette precedenti: va chiesta questa
+    return fields_of(rows[-1].text) if rows else None
+
+
 def _has_procedure(chat: list[Message]) -> bool:
-    reply = _ledger(chat, "prescription")
+    reply = _rx_reply(chat)
     return reply is not None and bool(reply.get("procedure"))
 
 
@@ -808,7 +822,7 @@ async def _advance_alone(
     citizen = _citizen(chat)
     if citizen is None:
         return
-    reply = _ledger(chat, "prescription")
+    reply = _rx_reply(chat)
     priority = None if reply is None else reply.get("priority")
     procedure = fixed or (None if reply is None else reply.get("procedure"))
     number = _number(chat)
@@ -817,7 +831,7 @@ async def _advance_alone(
     world = _latest_slots(chat)
     # Ask, then read the reply from history: the push of a ledger message does not open a turn.
     for _pass in range(3):
-        reply = _ledger(chat, "prescription")
+        reply = _rx_reply(chat)
         priority = None if reply is None else reply.get("priority")
         if priority == "P":
             offer_id = f"wl-{message.need_id or message.msg_id}"
@@ -857,8 +871,15 @@ async def _advance_alone(
         if not procedure:
             return
         state = None if reply is None else reply.get("state")
+        if fixed is None and _rx_expired(chat, reply, None):
+            # Ricetta scaduta (stato o rifiuto del Ledger): si rimanda al medico di base.
+            await _bc_ask_renewal(city, chat, citizen, number)
+            return
         if fixed is None and state not in (None, "issued"):
             return
+        if fixed is None and not _exact(chat, agent, "rules"):
+            # Regole in vigore (P1: ricette valide 2 giorni di agenda), lette una volta.
+            await _say(city, LEDGER, "rules")
         agenda = _ledger(chat, "agenda")
         now = _when("" if agenda is None else agenda.get("agenda_now", ""))
         world = _latest_slots(chat)
@@ -879,6 +900,10 @@ async def _advance_alone(
     else:
         return
     if now is None or world is None:
+        return
+    if fixed is None and _rx_expired(chat, _rx_reply(chat), now):
+        # Regola P1: la ricetta ha piu' di 2 giorni di agenda. Prenotarla costerebbe -1.
+        await _bc_ask_renewal(city, chat, citizen, _number(chat))
         return
     # A cancel drops every offer the citizen was holding, so the ones still free are sent again,
     # once per cancel: a second turn for the same cancel or refusal does not repeat them.
@@ -996,12 +1021,19 @@ async def _partner_cancel(
     fields = fields_of(message.text)
     offer_id = fields.get("offer_id", "")
     citizen = _citizen(chat)
+    expired = fields.get("reason") == "prescription_expired"
+    reason = "prescription_expired" if expired else "facility_cancelled"
     if (
         offer_id
         and citizen
         and not _we(chat, city.agent_id, f"offer_id={offer_id}", to=citizen, word="cancel")
     ):
-        await _say(city, citizen, f"cancel offer_id={offer_id} reason=facility_cancelled")
+        await _say(city, citizen, f"cancel offer_id={offer_id} reason={reason}")
+    if expired and fixed is None:
+        # Il Ledger ha rifiutato il commit per ricetta scaduta (P1): niente altre offerte,
+        # il cittadino passa dal medico di base per il rinnovo.
+        await _bc_ask_renewal(city, chat, citizen, _number(chat))
+        return
     await _advance(city, message, chat, fixed=fixed, replacing=True)
 
 
@@ -1256,6 +1288,100 @@ async def _bc_cross_reply(city: City, message: Message, chat: list[Message]) -> 
     return True
 
 
+# --- ricetta scaduta (regola P1): rinnovo dal medico di base -------------------------------
+# Il Ledger non documenta il formato esatto: si riconosce la scadenza da piu' segnali.
+_RX_VALID_DAYS = 2
+_RX_ISSUED_KEYS = ("issued_at", "issued", "agenda_issued", "issue_date", "created_at", "agenda_date")
+_RX_EXPIRY_KEYS = ("expires_at", "valid_until", "expiry", "expires")
+
+
+def _p1_active(chat: list[Message]) -> bool:
+    return any(
+        row.sender == LEDGER and first_word(row.text) == "rules" and "P1" in row.text.replace("=", " ").split()
+        for row in chat
+    ) or any(row.sender == LEDGER and "rule_id=P1" in row.text for row in chat)
+
+
+def _rx_expired(chat: list[Message], rx: dict[str, str] | None, now: datetime | None) -> bool:
+    """La ricetta corrente risulta scaduta per il Ledger o per la regola P1."""
+    if not rx:
+        return False
+    number = rx.get("prescription_number", "")
+    state = rx.get("state", "").lower()
+    if state in {"expired", "scaduta", "invalid"}:
+        return True
+    if rx.get("valid", "").lower() in {"false", "no", "0"}:
+        return True
+    # Rifiuto PRESCRIPTION_EXPIRED: conta solo se riguarda questa ricetta (numero nel testo) o
+    # se arriva dopo l'ultima lettura di questa ricetta, mai per una ricetta precedente.
+    seen_rx = False
+    for row in chat:
+        if row.sender != LEDGER:
+            continue
+        if first_word(row.text) == "prescription" and f"prescription_number={number}" in row.text.split():
+            seen_rx = True
+            continue
+        if "PRESCRIPTION_EXPIRED" not in row.text:
+            continue
+        if number and number in row.text:
+            return True
+        if seen_rx and "prescription_number-" not in row.text:
+            return True
+    if now is None:
+        return False
+    for key in _RX_EXPIRY_KEYS:
+        until = _when(rx.get(key, ""))
+        if until is not None and now >= until:
+            return True
+    if _p1_active(chat):
+        for key in _RX_ISSUED_KEYS:
+            issued = _when(rx.get(key, ""))
+            if issued is not None:
+                return now >= issued + timedelta(days=_RX_VALID_DAYS)
+    return False
+
+
+_BC_RENEW_IT = (
+    "La sua ricetta risulta scaduta, quindi non posso prenotarla: torni dal medico di base "
+    "indicando il numero di ricetta per il rinnovo, poi mi riscriva con la ricetta nuova e le "
+    "propongo subito gli orari."
+)
+_BC_RENEW_EN = (
+    "Your prescription has expired, so I cannot book it: please go back to your GP with the "
+    "prescription number to renew it, then write to me with the new prescription and I will "
+    "propose the available times right away."
+)
+
+
+async def _bc_ask_renewal(
+    city: City, chat: list[Message], citizen: str | None, number: str | None
+) -> None:
+    """data.request purpose=prescription_renewal (formato del kit), una sola volta per ricetta."""
+    if not citizen:
+        return
+    token = f"prescription_number={number}" if number else "purpose=prescription_renewal"
+    for row in chat:
+        if (
+            row.sender == city.agent_id and row.recipient == citizen
+            and "data.request" in words(row.text) and "purpose=prescription_renewal" in row.text
+            and token in row.text.split()
+        ):
+            return
+    note = _BC_RENEW_EN if _lang(chat) == "en" else _BC_RENEW_IT
+    act = "data.request purpose=prescription_renewal fields=prescription_number"
+    if number:
+        act += f" prescription_number={number}"
+    await _say(city, citizen, f"{act}\n{note}")
+
+
+def _cancel_reason(chat: list[Message]) -> str:
+    """Motivo dell'annullamento visto dalla struttura: ricetta scaduta o generico (ultimo rifiuto)."""
+    refusals = [row for row in chat if row.sender == LEDGER and first_word(row.text) == "refused"]
+    if refusals and "PRESCRIPTION_EXPIRED" in refusals[-1].text:
+        return "prescription_expired"
+    return "facility_cancelled"
+
+
 _WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 # Offerte dei partner ancora in piedi davanti al cittadino: oltre questo numero non se ne
 # inoltrano altre finché il cittadino non ne rifiuta qualcuna (niente raffiche di offerte).
@@ -1334,7 +1460,7 @@ def _bc_partner_offer_line(
     procedure = info.get("procedure", "")
     if not _bc_asked_partner(chat, city.agent_id, message.sender, procedure):
         return None
-    rx = _ledger(chat, "prescription")
+    rx = _rx_reply(chat)
     agenda = _ledger(chat, "agenda")
     citizen = _citizen(chat)
     now = _when((agenda or {}).get("agenda_now", ""))
@@ -1707,7 +1833,7 @@ async def _on_refused(
         and offer_id
         and not _we(chat, agent, f"offer_id={offer_id}", to=target, word="cancel")
     ):
-        await _say(city, target, f"cancel offer_id={offer_id} reason=facility_cancelled")
+        await _say(city, target, f"cancel offer_id={offer_id} reason={_cancel_reason(chat)}")
     if hold_self:
         await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
 

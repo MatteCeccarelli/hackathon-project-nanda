@@ -1605,6 +1605,14 @@ async def _on_committed(city: City, message: Message, chat: list[Message]) -> No
     await _say(city, target, f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}")
 
 
+def _cancel_reason(chat: list[Message]) -> str:
+    """Motivo dell'annullamento visto dalla struttura: ricetta scaduta o generico (ultimo rifiuto)."""
+    refusals = [row for row in chat if row.sender == LEDGER and first_word(row.text) == "refused"]
+    if refusals and "PRESCRIPTION_EXPIRED" in refusals[-1].text:
+        return "prescription_expired"
+    return "facility_cancelled"
+
+
 async def _on_refused(
     city: City, message: Message, chat: list[Message], *, hold_self: bool
 ) -> None:
@@ -1625,7 +1633,7 @@ async def _on_refused(
         and offer_id
         and not _we(chat, agent, f"offer_id={offer_id}", to=target, word="cancel")
     ):
-        await _say(city, target, f"cancel offer_id={offer_id} reason=facility_cancelled")
+        await _say(city, target, f"cancel offer_id={offer_id} reason={_cancel_reason(chat)}")
     if hold_self:
         await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
 
