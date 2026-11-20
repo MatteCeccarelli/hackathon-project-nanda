@@ -345,6 +345,21 @@ def _speaks(doctor_id: str, lang: str) -> bool:
     return "*" in langs and lang not in {"it", "en"}
 
 
+def _is_urgent_reserve(slot: dict[str, str], at: datetime | None = None) -> bool:
+    val = slot.get("urgent_reserve", "").lower()
+    if val in ("true", "1", "yes"):
+        return True
+    slot_id = slot.get("slot_id", "")
+    if slot_id.endswith("-0900") or "-09:00" in slot_id or "-0900-" in slot_id:
+        return True
+    if at is not None and at.hour == 9 and at.minute == 0:
+        return True
+    at_str = slot.get("at") or slot.get("agenda_date") or ""
+    if "T09:00" in at_str:
+        return True
+    return False
+
+
 def fitting(
     lines: list[str],
     *,
@@ -359,11 +374,13 @@ def fitting(
 
     if priority == "U":
         horizon: datetime | None = now.replace(hour=23, minute=59, second=59, microsecond=0)
+        earliest = now + timedelta(minutes=15)
     elif priority == "P":
         horizon = None
+        earliest = now + _LEAD
     else:
         horizon = now + timedelta(days=_DEADLINE_DAYS.get(priority or "", 14))
-    earliest = now + _LEAD
+        earliest = now + _LEAD
     chosen: list[tuple[datetime, dict[str, str]]] = []
     for line in lines:
         slot = fields_of(line)
@@ -379,7 +396,7 @@ def fitting(
         free = slot.get("free")
         if free is not None and free.isdigit() and int(free) <= 0:
             continue
-        reserve = slot.get("urgent_reserve", "").lower() == "true"
+        reserve = _is_urgent_reserve(slot, at)
         if reserve and priority != "U":
             continue
         if not earliest < at or (horizon is not None and at >= horizon):
@@ -809,6 +826,8 @@ def _offer_line(slot: dict[str, str], number: str | None, priority: str | None) 
         f"agenda_day={slot['day']}",
         f"expiry={slot['at']}",
     ]
+    if _is_urgent_reserve(slot):
+        parts.append("urgent_reserve=true")
     if priority:
         parts.append(f"priority={priority}")
     if number:
