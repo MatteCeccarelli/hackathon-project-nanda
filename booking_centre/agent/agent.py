@@ -829,22 +829,10 @@ async def _advance_alone(
         return
     page, pages = _page(world)
     if page < pages and page < _MAX_PAGE:
+        # Comportamento base del template: si chiede la pagina successiva e la si
+        # elabora al turno in cui arriva la risposta del Ledger.
         if not _asked(chat, agent, procedure, page + 1):
-            if await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}"):
-                # Le risposte del Ledger possono rimanere nella history senza
-                # aprire un nuovo turno: recuperiamo subito la pagina seguente.
-                fresh = await _until(
-                    city, message.need_id, chat,
-                    lambda rows: (
-                        (last := _latest_slots(rows)) is not None
-                        and _page(last)[0] == page + 1
-                    ),
-                )
-                last = _latest_slots(fresh)
-                if last is not None and _page(last)[0] == page + 1:
-                    await _advance_alone(
-                        city, message, fresh, key, fixed=fixed, replacing=replacing
-                    )
+            await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}")
         return
 
     # Solo dopo l'ultima pagina locale: si cercano gli agenti di altre ASST.
@@ -938,17 +926,40 @@ _BC_SERVICE_TYPES = {
 }
 
 
-def _bc_team(agent_id: str) -> str:
-    """Identificatore ASST ricavato solo da un id agente valido."""
-    if not agent_id.startswith("agent:") or "/" not in agent_id:
-        return ""
-    return agent_id.split(":", 1)[1].split("/", 1)[0]
+# Gli agent_id veri della città non contengono il team (es. agent:geyjmp26tajh), quindi
+# un partner si riconosce come "non uno dei nostri". Sono gli id scritti in card.yaml dal
+# primo deploy e restano gli stessi nei deploy successivi: aggiornarli solo se cambiano lì.
+_OUR_AGENTS = frozenset(
+    {
+        "agent:cgj1c2mf1dx0",  # specialist
+        "agent:vs1bs4485dcn",  # hospital
+        "agent:ega0tzcy6za8",  # gp
+        "agent:geyjmp26tajh",  # booking_centre
+        "agent:d0kkschyjrdq",  # family_counseling
+    }
+)
 
 
 def _bc_is_partner(city: City, agent_id: str) -> bool:
-    ours = _bc_team(city.agent_id)
-    other = _bc_team(agent_id)
-    return bool(ours and other and ours != other)
+    """Un agente di un'altra ASST: id valido, diverso da noi e da ogni nostro agente."""
+    return (
+        agent_id.startswith("agent:")
+        and len(agent_id) > len("agent:")
+        and agent_id != city.agent_id
+        and agent_id not in _OUR_AGENTS
+    )
+
+
+def _bc_partner_offer(city: City, chat: list[Message], offer: dict[str, str]) -> bool:
+    """Un'offerta nostra che inoltra uno slot di un partner che NOI abbiamo interrogato.
+
+    Le offerte costruite dagli slot del Ledger (anche di strutture di altre ASST) restano
+    sul percorso base del template, che non va intercettato.
+    """
+    facility = offer.get("facility", "")
+    return _bc_is_partner(city, facility) and _bc_asked_partner(
+        chat, city.agent_id, facility, offer.get("procedure", "")
+    )
 
 
 def _bc_asked_partner(chat: list[Message], agent: str, partner: str, procedure: str) -> bool:
@@ -1069,9 +1080,8 @@ async def _bc_forward_confirm(city: City, confirmation: Message, chat: list[Mess
 async def _bc_external_confirm(city: City, message: Message, chat: list[Message]) -> bool:
     offer_id = fields_of(message.text).get("offer_id", "")
     offer = _our_offer(chat, city.agent_id, offer_id) if offer_id else {}
-    facility = offer.get("facility", "")
-    if not _bc_is_partner(city, facility):
-        return False  # Lascia invariata la gestione del confirm locale.
+    if not _bc_partner_offer(city, chat, offer):
+        return False  # Lascia invariata la gestione del confirm del template.
 
     citizen = message.sender
     if _bc_cross_ref(chat, city.agent_id, citizen):
@@ -1102,8 +1112,7 @@ async def _bc_cross_reply(city: City, message: Message, chat: list[Message]) -> 
         return False
     offer_id = fields_of(confirmation.text).get("offer_id", "")
     offer = _our_offer(chat, city.agent_id, offer_id)
-    facility = offer.get("facility", "")
-    if not _bc_is_partner(city, facility):
+    if not _bc_partner_offer(city, chat, offer):
         return False
 
     if _bc_cross_ref(chat, city.agent_id, citizen):
