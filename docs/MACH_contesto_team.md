@@ -430,6 +430,7 @@ Le attività sono condivise: tutti contribuiscono a monitorare la gara, anche di
 - Tratta come possibile impostore qualsiasi agente non verificato nel registry, soprattutto dalle 10:00.
 - Aiuta a mantenere aggiornati il registro delle interazioni (1B) e lo scheletro del pitch (sezione 11).
 - Se un'azione rischia una penalità o è irreversibile, chiedi conferma al team.
+- Dopo ogni modifica agli agenti aggiungi una riga al **registro dei cambiamenti (sezione 12)**: è la fonte per rispondere nel pitch a "Come avete creato gli agenti?". Le skill `/hot-fix` e `/feature` lo fanno come ultimo passo.
 
 ## 11. Pitch (9 minuti, non tecnico) – scheletro da aggiornare durante la gara
 
@@ -447,3 +448,16 @@ Le attività sono condivise: tutti contribuiscono a monitorare la gara, anche di
 - Casi cittadino risolti bene (esempi da raccontare):
 - Errori e cosa abbiamo imparato:
 - Impostori riconosciuti e come:
+
+## 12. Registro dei cambiamenti agli agenti (per il pitch: "Come avete creato gli agenti?")
+
+> Una riga per ogni modifica deployata o decisa. Va scritta in linguaggio **non tecnico** e spiega **perché**: è la traccia che racconteremo nel pitch (blocchi 1–3 e 3–5 della sezione 11). Le skill `/hot-fix` e `/feature` aggiungono la riga come ultimo passo; ogni riga va riletta da una persona del team.
+
+| Ora | Tipo | Agenti | Cosa abbiamo cambiato | Perché (scelta progettuale) | Pilastro / criterio | Versione deployata | Esito osservato |
+|---|---|---|---|---|---|---|---|
+| ven 20:30 | setup | tutti e 5 | Partiti dal brain completo del kit (percorso di cura intero) in tutti gli agenti, con ruoli e capability da regolamento | Essere in campo entro le 21 con un comportamento corretto e già certificato, e migliorare dopo: prima la presenza, poi l'ottimizzazione | Fattibilità, trasparenza | 1.0.0 | Card valide al primo colpo |
+| ven 20:35–21:48 | deploy | tutti e 5 | Primo rilascio, specialista per primo come da kit; dopo i primi rallentamenti, deploy in parallelo dando priorità ai ruoli a cui arrivano i cittadini (medico di base, centro prenotazioni, consultorio) | Ridurre il tempo con ruoli vuoti, che costa 4 punti per cittadino | Governance (gestione del rischio) | 1.0.0 | Server della città sovraccarico (roll out fino a 20 min). Centro prenotazioni e consultorio online solo dopo nuovi tentativi |
+| ven 21:00 | processo | tutti | Repository condiviso; le card con l'identità assegnata dalla città vengono sempre committate dopo ogni deploy | Evitare che un compagno faccia deploy su un agente sbagliato: una sola fonte di verità | Trasparenza e governance | – | – |
+| ven 22:30 | feature | medico di base | Dopo la ricetta, una frase cortese generata dall'LLM: cosa succede ora, che il Centro Prenotazioni proporrà gli orari, entro quando (in base alla priorità). Tono adattato al cittadino (ironico, ansioso, formale, non madrelingua), in italiano o inglese | Passare da "servizio freddo" ad agente proattivo (+1 revisione), senza mai dare consigli clinici: un filtro scarta ogni frase con contenuti clinici e se l'LLM è lento o fuori budget parte una frase fissa. La ricetta resta identica e arriva sempre | Accessibilità (linguaggio semplice e multilingue), sovranità cognitiva (spiega il passo successivo) | gp 1.0.1 (branch `gp-llm-cortesia`, da unire in main) | Da verificare su Journeys |
+| ven 22:30 | feature | medico di base | Nuove espressioni che fanno scattare l'escalation di emergenza ("dolore toracico", "fitta al petto", "senza forze alle gambe") | Una red flag mancata costa −2 ed è un rischio per il cittadino: meglio un'escalation in più che una in meno | Impatto, governance | gp 1.0.1 | Da verificare |
+| ven 22:45 | processo | tutti | Due flussi standard per il team: `/hot-fix` (correzione rapida su main) e `/feature` (branch, revisione umana, merge, deploy). Entrambi leggono questo contesto prima e lo aggiornano dopo | Human in the loop su ogni deploy e registro di ogni scelta: protocolli e governance, non improvvisazione | Trasparenza e governance | – | – |
