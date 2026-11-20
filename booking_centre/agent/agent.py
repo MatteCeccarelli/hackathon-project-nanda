@@ -663,6 +663,20 @@ async def _desk(
 ) -> None:
     if message.sender == city.agent_id:
         return
+
+    # Solo il centro prenotazioni usa la collaborazione tra ASST.
+    # Il consultorio mantiene il percorso diretto della baseline.
+    if fixed is None and not hold_self:
+        if message.sender.startswith("agent:") and first_word(message.text) == "offer":
+            await _bc_external_offer(city, message, chat)
+            return
+        if message.sender.startswith("citizen:"):
+            if first_word(message.text) == "confirm":
+                if await _bc_external_confirm(city, message, chat):
+                    return
+            elif await _bc_cross_reply(city, message, chat):
+                return
+
     kind = words(message.text)
     if "confirm" in kind and (
         message.sender.startswith("citizen:") or message.sender.startswith("agent:")
@@ -814,8 +828,16 @@ async def _advance_alone(
     if taken and not replacing:
         return
     page, pages = _page(world)
-    if page < pages and page < _MAX_PAGE and not _asked(chat, agent, procedure, page + 1):
-        await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}")
+    if page < pages and page < _MAX_PAGE:
+        # Comportamento base del template: si chiede la pagina successiva e la si
+        # elabora al turno in cui arriva la risposta del Ledger.
+        if not _asked(chat, agent, procedure, page + 1):
+            await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}")
+        return
+
+    # Solo dopo l'ultima pagina locale: si cercano gli agenti di altre ASST.
+    if fixed is None:
+        await _bc_discover(city, message, chat, key, procedure, priority)
 
 
 async def _on_confirm(
@@ -890,6 +912,273 @@ async def _partner_cancel(
     ):
         await _say(city, citizen, f"cancel offer_id={offer_id} reason=facility_cancelled")
     await _advance(city, message, chat, fixed=fixed, replacing=True)
+
+
+
+
+# --- centro prenotazioni: collaborazione inter-ASST ---------------------------------------------
+# I messaggi need.request ai peer contengono solo criteri di ricerca, mai dati personali.
+# Le operazioni hold/commit restano di competenza della facility destinataria.
+
+_BC_SERVICE_TYPES = {
+    "VIS-FIS": "hospital.physiatry",
+    "VIS-CARD": "specialist_care.cardiology",
+}
+
+
+# Gli agent_id veri della città non contengono il team (es. agent:geyjmp26tajh), quindi
+# un partner si riconosce come "non uno dei nostri". Sono gli id scritti in card.yaml dal
+# primo deploy e restano gli stessi nei deploy successivi: aggiornarli solo se cambiano lì.
+_OUR_AGENTS = frozenset(
+    {
+        "agent:cgj1c2mf1dx0",  # specialist
+        "agent:vs1bs4485dcn",  # hospital
+        "agent:ega0tzcy6za8",  # gp
+        "agent:geyjmp26tajh",  # booking_centre
+        "agent:d0kkschyjrdq",  # family_counseling
+    }
+)
+
+
+def _bc_is_partner(city: City, agent_id: str) -> bool:
+    """Un agente di un'altra ASST: id valido, diverso da noi e da ogni nostro agente."""
+    return (
+        agent_id.startswith("agent:")
+        and len(agent_id) > len("agent:")
+        and agent_id != city.agent_id
+        and agent_id not in _OUR_AGENTS
+    )
+
+
+def _bc_partner_offer(city: City, chat: list[Message], offer: dict[str, str]) -> bool:
+    """Un'offerta nostra che inoltra uno slot di un partner che NOI abbiamo interrogato.
+
+    Le offerte costruite dagli slot del Ledger (anche di strutture di altre ASST) restano
+    sul percorso base del template, che non va intercettato.
+    """
+    facility = offer.get("facility", "")
+    return _bc_is_partner(city, facility) and _bc_asked_partner(
+        chat, city.agent_id, facility, offer.get("procedure", "")
+    )
+
+
+def _bc_asked_partner(chat: list[Message], agent: str, partner: str, procedure: str) -> bool:
+    """Autorizzazione a considerare una risposta: quel partner fu interrogato per la procedura."""
+    return any(
+        row.sender == agent and row.recipient == partner
+        and first_word(row.text) == "need.request"
+        and fields_of(row.text).get("procedure") == procedure
+        for row in chat
+    )
+
+
+async def _bc_discover(
+    city: City,
+    message: Message,
+    chat: list[Message],
+    key: str,
+    procedure: str,
+    priority: str | None,
+) -> None:
+    """Fallback dopo l'esaurimento del catalogo locale, senza trasmettere dati del cittadino."""
+    service = _BC_SERVICE_TYPES.get(procedure)
+    if not service or priority in (None, "P") or not _number(chat):
+        return
+    # Non aprire nuove ricerche se abbiamo gia' proposto uno slot valido.
+    if _offered(chat, city.agent_id) or _sent(key).offers:
+        return
+    try:
+        peers = await city.find(service)
+    except CapError:
+        return
+
+    contacted = 0
+    for peer in peers:
+        peer_id = getattr(peer, "agent_id", "")
+        if not _bc_is_partner(city, peer_id):
+            continue
+        capabilities = getattr(peer, "capabilities", ())
+        if capabilities and service not in capabilities:
+            continue
+        if _bc_asked_partner(chat, city.agent_id, peer_id, procedure):
+            continue
+        request = (
+            f"need.request service_type={service} procedure={procedure} "
+            f"priority={priority} request_id={key}"
+        )
+        if await _say(city, peer_id, request):
+            contacted += 1
+        if contacted >= 12:
+            break
+
+
+def _bc_latest_consent_request(chat: list[Message], agent: str, citizen: str) -> int:
+    """Posizione dell'ultima richiesta esplicita di consenso cross_asst."""
+    index = -1
+    for i, row in enumerate(chat):
+        if (
+            row.sender == agent and row.recipient == citizen
+            and first_word(row.text) == "consent"
+            and fields_of(row.text).get("purpose") == "cross_asst"
+        ):
+            index = i
+    return index
+
+
+def _bc_cross_ref(chat: list[Message], agent: str, citizen: str) -> str:
+    """Accetta solo il consent_ref ricevuto dopo un consenso cross_asst richiesto."""
+    request_index = _bc_latest_consent_request(chat, agent, citizen)
+    if request_index < 0:
+        return ""
+    for row in chat[request_index + 1:]:
+        if row.sender != citizen:
+            continue
+        data = fields_of(row.text)
+        if (
+            first_word(row.text) == "consent"
+            and data.get("consent_ref")
+            and data.get("purpose", "cross_asst") == "cross_asst"
+        ):
+            return data["consent_ref"]
+    return ""
+
+
+def _bc_recent_confirmation(chat: list[Message], citizen: str, before: int | None = None) -> Message | None:
+    rows = chat if before is None else chat[:before]
+    for row in reversed(rows):
+        if row.sender == citizen and first_word(row.text) == "confirm":
+            return row
+    return None
+
+
+async def _bc_forward_confirm(city: City, confirmation: Message, chat: list[Message]) -> None:
+    """Invia dati identificativi SOLO dopo un consenso cross-ASST valido."""
+    citizen = confirmation.sender
+    offer_id = fields_of(confirmation.text).get("offer_id", "")
+    offer = _our_offer(chat, city.agent_id, offer_id) if offer_id else {}
+    facility = offer.get("facility", "")
+    slot = offer.get("slot_id", "")
+    consent = _bc_cross_ref(chat, city.agent_id, citizen)
+    if not (offer_id and slot and consent and _bc_is_partner(city, facility)):
+        return
+    # Evita di utilizzare offerte mai ricevute dalla facility dichiarata.
+    if not _bc_asked_partner(chat, city.agent_id, facility, offer.get("procedure", "")):
+        return
+    if _we(chat, city.agent_id, f"slot_id={slot}", to=facility, word="confirm"):
+        return
+    parts = [
+        "confirm", f"offer_id={offer_id}", f"slot_id={slot}",
+        f"facility={facility}", f"citizen={citizen}",
+        f"consent_ref={consent}",
+    ]
+    number = offer.get("prescription_number") or _number(chat)
+    if number:
+        parts.append(f"prescription_number={number}")
+    await _say(city, facility, " ".join(parts))
+
+
+async def _bc_external_confirm(city: City, message: Message, chat: list[Message]) -> bool:
+    offer_id = fields_of(message.text).get("offer_id", "")
+    offer = _our_offer(chat, city.agent_id, offer_id) if offer_id else {}
+    if not _bc_partner_offer(city, chat, offer):
+        return False  # Lascia invariata la gestione del confirm del template.
+
+    citizen = message.sender
+    if _bc_cross_ref(chat, city.agent_id, citizen):
+        await _bc_forward_confirm(city, message, chat)
+        return True
+
+    if _bc_latest_consent_request(chat, city.agent_id, citizen) < 0:
+        await _say(
+            city, citizen,
+            "consent purpose=cross_asst Posso condividere con un'altra ASST "
+            "i dati necessari alla prenotazione?",
+        )
+    return True
+
+
+async def _bc_cross_reply(city: City, message: Message, chat: list[Message]) -> bool:
+    """Riprende il confirm sospeso dopo il consenso, o cancella l'offerta in caso di no."""
+    citizen = message.sender
+    request_index = _bc_latest_consent_request(chat, city.agent_id, citizen)
+    if request_index < 0:
+        return False
+    # Non consumare normali need.request che non sono risposte alla richiesta di consenso.
+    after = chat[request_index + 1:]
+    if not any(row.msg_id == message.msg_id for row in after):
+        return False
+    confirmation = _bc_recent_confirmation(chat, citizen, before=request_index)
+    if confirmation is None:
+        return False
+    offer_id = fields_of(confirmation.text).get("offer_id", "")
+    offer = _our_offer(chat, city.agent_id, offer_id)
+    if not _bc_partner_offer(city, chat, offer):
+        return False
+
+    if _bc_cross_ref(chat, city.agent_id, citizen):
+        await _bc_forward_confirm(city, confirmation, chat)
+    elif not _we(chat, city.agent_id, f"offer_id={offer_id}", to=citizen, word="cancel"):
+        # Il rifiuto in linguaggio naturale non fornisce consent_ref.
+        await _say(city, citizen, f"cancel offer_id={offer_id} reason=cross_asst_consent_declined")
+    return True
+
+
+async def _bc_external_offer(city: City, message: Message, chat: list[Message]) -> None:
+    """Inoltra offerte effettive di un partner interrogato, senza inventare attributi."""
+    if not _bc_is_partner(city, message.sender):
+        return
+    info = fields_of(message.text)
+    procedure = info.get("procedure", "")
+    if not _bc_asked_partner(chat, city.agent_id, message.sender, procedure):
+        return
+    rx = _ledger(chat, "prescription")
+    agenda = _ledger(chat, "agenda")
+    citizen = _citizen(chat)
+    now = _when((agenda or {}).get("agenda_now", ""))
+    at_text = info.get("agenda_date") or info.get("at", "")
+    at = _when(at_text)
+    if not rx or not citizen or not now or not at:
+        return
+    if rx.get("procedure") != procedure or rx.get("state", "issued") != "issued":
+        return
+    if info.get("facility") != message.sender:
+        return
+    needed = ("offer_id", "slot_id", "doctor_id", "agenda_day", "expiry")
+    if any(not info.get(field) for field in needed):
+        return
+
+    priority = rx.get("priority", "")
+    if at <= now + _LEAD:
+        return
+    if priority == "U" and at.date() != now.date():
+        return
+    if priority in _DEADLINE_DAYS and at >= now + timedelta(days=_DEADLINE_DAYS[priority]):
+        return
+    if info.get("urgent_reserve", "").lower() == "true" and priority != "U":
+        return
+    if info.get("free", "1") == "0":
+        return
+    expiry = _when(info["expiry"])
+    if expiry is None or expiry <= now:
+        return
+
+    offer_id = info["offer_id"]
+    if _our_offer(chat, city.agent_id, offer_id):
+        return
+    if _we(chat, city.agent_id, f"slot_id={info['slot_id']}", to=citizen, word="offer"):
+        return
+    fields = [
+        "offer", f"offer_id={offer_id}", f"slot_id={info['slot_id']}",
+        f"doctor_id={info['doctor_id']}", f"facility={message.sender}",
+        f"procedure={procedure}", f"agenda_date={at_text}",
+        f"agenda_day={info['agenda_day']}", f"expiry={info['expiry']}",
+        f"priority={priority}",
+    ]
+    number = _number(chat)
+    if number:
+        fields.append(f"prescription_number={number}")
+    if await _say(city, citizen, " ".join(fields)):
+        _sent(message.need_id or message.msg_id).offers.add(info["slot_id"])
 
 
 # --- facility ----------------------------------------------------------------------------------
