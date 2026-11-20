@@ -992,6 +992,16 @@ async def _bc_discover(
     except CapError:
         return
 
+    # Criteri di ricerca (non dati personali): lingua e genere preferiti aiutano il partner
+    # a proporre il medico giusto invece di slot che il cittadino rifiuterebbe.
+    criteria = ""
+    lang = _lang(chat)
+    if lang and lang != "it":
+        criteria += f" lang={lang}"
+    gender = _gender(chat)
+    if gender:
+        criteria += f" gender_preference={gender}"
+
     contacted = 0
     for peer in peers:
         peer_id = getattr(peer, "agent_id", "")
@@ -1004,12 +1014,44 @@ async def _bc_discover(
             continue
         request = (
             f"need.request service_type={service} procedure={procedure} "
-            f"priority={priority} request_id={key}"
+            f"priority={priority} request_id={key}{criteria}"
         )
         if await _say(city, peer_id, request):
             contacted += 1
         if contacted >= 12:
             break
+
+    # Il cittadino non resta senza risposta mentre aspettiamo i partner.
+    citizen = _citizen(chat)
+    if contacted and citizen:
+        note = _BC_SEARCHING_EN if lang and lang != "it" else _BC_SEARCHING_IT
+        if not any(
+            row.sender == city.agent_id and row.recipient == citizen and row.text == note
+            for row in chat
+        ):
+            await _say(city, citizen, note)
+
+
+_BC_SEARCHING_IT = (
+    "Nella nostra ASST non ci sono posti adatti alle sue preferenze entro la scadenza della "
+    "ricetta: sto chiedendo alle altre ASST e le invio le loro proposte appena arrivano."
+)
+_BC_SEARCHING_EN = (
+    "Our ASST has no free time that fits your preferences before your prescription deadline: "
+    "I am asking the other ASSTs and will send you their options as soon as they arrive."
+)
+
+
+def _bc_fits_citizen(chat: list[Message], doctor_id: str) -> bool:
+    """Lingua e genere del medico dal registry (stessa tabella degli slot locali)."""
+    if not _speaks(doctor_id, _lang(chat)):
+        return False
+    gender = _gender(chat)
+    if gender:
+        spec = _DOCTORS.get(doctor_id.rsplit("-", 1)[-1])
+        if spec is None or spec[1] != gender:
+            return False
+    return True
 
 
 def _bc_latest_consent_request(chat: list[Message], agent: str, citizen: str) -> int:
@@ -1160,6 +1202,10 @@ async def _bc_external_offer(city: City, message: Message, chat: list[Message]) 
         return
     expiry = _when(info["expiry"])
     if expiry is None or expiry <= now:
+        return
+    # Mai inoltrare un medico che non parla la lingua del cittadino (o del genere sbagliato):
+    # il cittadino lo rifiuterebbe e il percorso resterebbe aperto.
+    if not _bc_fits_citizen(chat, info["doctor_id"]):
         return
 
     offer_id = info["offer_id"]
