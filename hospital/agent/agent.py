@@ -137,6 +137,9 @@ async def handle(role: str, city: City, message: Message, chat: list[Message]) -
     if street and _asks_address(message):
         await city.say(message.sender, f"address={street}")
         return
+    if role in _FAC_PROCEDURES and _fac_partner_request(message):
+        await _fac_answer_partner(city, message, chat, role)
+        return
     if role == "gp":
         await _gp(city, message, chat)
     elif role == "booking_centre":
@@ -331,14 +334,39 @@ def _rx(need_id: str | None, msg_id: str) -> str:
     return number if _RX.fullmatch(number) else "prescription_number-CASE"
 
 
-def _speaks(doctor_id: str, lang: str) -> bool:
+# Lingua rara del medico h3 di ogni ASST (``*`` nella tabella _DOCTORS). La nostra (ortica)
+# viene dal registry della console; le altre dalla tabella concordata su Discord tra le squadre.
+_RARE_BY_ASST = {
+    "ortica": "wo",
+    "giambellino": "ka",
+    "toros": "ro",
+    "nord": "ur",
+    "gorla": "sq",
+    "brera": "fa",
+}
+
+
+def _asst_of(doctor_id: str) -> str:
+    """``asst-nord-h3`` -> ``nord``; stringa vuota se il formato non è riconosciuto."""
+    parts = doctor_id.split("-")
+    return "-".join(parts[1:-1]) if len(parts) >= 3 and parts[0] == "asst" else ""
+
+
+def _speaks(doctor_id: str, lang: str, hint: str = "") -> bool:
     spec = _DOCTORS.get(doctor_id.rsplit("-", 1)[-1])
     if spec is None:
         return False
     langs = spec[0]
     if lang in langs:
         return True
-    return "*" in langs and lang not in {"it", "en"}
+    if "*" not in langs or lang in {"it", "en"}:
+        return False
+    # Lingua rara: vale solo se è quella dell'ASST del medico. Se l'ASST non è in tabella,
+    # ci si appoggia all'indicazione del partner (doctor_lang), che non viene mai inoltrata.
+    rare = _RARE_BY_ASST.get(_asst_of(doctor_id))
+    if rare is not None:
+        return rare == lang
+    return lang in hint.replace(",", "/").split("/")
 
 
 def fitting(
@@ -663,6 +691,29 @@ async def _desk(
 ) -> None:
     if message.sender == city.agent_id:
         return
+
+    # Solo il centro prenotazioni usa la collaborazione tra ASST.
+    # Il consultorio mantiene il percorso diretto della baseline.
+    if fixed is None and not hold_self:
+        if message.sender.startswith("agent:") and _bc_offer_lines(message.text):
+            await _bc_external_offer(city, message, chat)
+            return
+        if (
+            message.sender.startswith("agent:")
+            and "cancel" in words(message.text)
+            and not fields_of(message.text).get("offer_id")
+            and fields_of(message.text).get("request_id")
+        ):
+            # cancel reason=no_availability request_id=...: il partner non ha posto.
+            # Nessuna offerta da ritirare: non si riapre la ricerca locale.
+            return
+        if message.sender.startswith("citizen:"):
+            if first_word(message.text) == "confirm":
+                if await _bc_external_confirm(city, message, chat):
+                    return
+            elif await _bc_cross_reply(city, message, chat):
+                return
+
     kind = words(message.text)
     if "confirm" in kind and (
         message.sender.startswith("citizen:") or message.sender.startswith("agent:")
@@ -814,8 +865,16 @@ async def _advance_alone(
     if taken and not replacing:
         return
     page, pages = _page(world)
-    if page < pages and page < _MAX_PAGE and not _asked(chat, agent, procedure, page + 1):
-        await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}")
+    if page < pages and page < _MAX_PAGE:
+        # Comportamento base del template: si chiede la pagina successiva e la si
+        # elabora al turno in cui arriva la risposta del Ledger.
+        if not _asked(chat, agent, procedure, page + 1):
+            await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}")
+        return
+
+    # Solo dopo l'ultima pagina locale: si cercano gli agenti di altre ASST.
+    if fixed is None:
+        await _bc_discover(city, message, chat, key, procedure, priority)
 
 
 async def _on_confirm(
@@ -890,6 +949,474 @@ async def _partner_cancel(
     ):
         await _say(city, citizen, f"cancel offer_id={offer_id} reason=facility_cancelled")
     await _advance(city, message, chat, fixed=fixed, replacing=True)
+
+
+
+
+# --- centro prenotazioni: collaborazione inter-ASST ---------------------------------------------
+# I messaggi need.request ai peer contengono solo criteri di ricerca, mai dati personali.
+# Le operazioni hold/commit restano di competenza della facility destinataria.
+
+_BC_SERVICE_TYPES = {
+    "VIS-FIS": "hospital.physiatry",
+    "VIS-CARD": "specialist_care.cardiology",
+}
+
+
+# Gli agent_id veri della città non contengono il team (es. agent:geyjmp26tajh), quindi
+# un partner si riconosce come "non uno dei nostri". Sono gli id scritti in card.yaml dal
+# primo deploy e restano gli stessi nei deploy successivi: aggiornarli solo se cambiano lì.
+_OUR_AGENTS = frozenset(
+    {
+        "agent:cgj1c2mf1dx0",  # specialist
+        "agent:vs1bs4485dcn",  # hospital
+        "agent:ega0tzcy6za8",  # gp
+        "agent:geyjmp26tajh",  # booking_centre
+        "agent:d0kkschyjrdq",  # family_counseling
+    }
+)
+
+
+def _bc_is_partner(city: City, agent_id: str) -> bool:
+    """Un agente di un'altra ASST: id valido, diverso da noi e da ogni nostro agente."""
+    return (
+        agent_id.startswith("agent:")
+        and len(agent_id) > len("agent:")
+        and agent_id != city.agent_id
+        and agent_id not in _OUR_AGENTS
+    )
+
+
+def _bc_partner_offer(city: City, chat: list[Message], offer: dict[str, str]) -> bool:
+    """Un'offerta nostra che inoltra uno slot di un partner che NOI abbiamo interrogato.
+
+    Le offerte costruite dagli slot del Ledger (anche di strutture di altre ASST) restano
+    sul percorso base del template, che non va intercettato.
+    """
+    facility = offer.get("facility", "")
+    return _bc_is_partner(city, facility) and _bc_asked_partner(
+        chat, city.agent_id, facility, offer.get("procedure", "")
+    )
+
+
+def _bc_asked_partner(chat: list[Message], agent: str, partner: str, procedure: str) -> bool:
+    """Autorizzazione a considerare una risposta: quel partner fu interrogato per la procedura."""
+    return any(
+        row.sender == agent and row.recipient == partner
+        and first_word(row.text) == "need.request"
+        and fields_of(row.text).get("procedure") == procedure
+        for row in chat
+    )
+
+
+async def _bc_discover(
+    city: City,
+    message: Message,
+    chat: list[Message],
+    key: str,
+    procedure: str,
+    priority: str | None,
+) -> None:
+    """Fallback dopo l'esaurimento del catalogo locale, senza trasmettere dati del cittadino."""
+    service = _BC_SERVICE_TYPES.get(procedure)
+    if not service or priority in (None, "P") or not _number(chat):
+        return
+    # Non aprire nuove ricerche se abbiamo gia' proposto uno slot valido.
+    if _offered(chat, city.agent_id) or _sent(key).offers:
+        return
+    try:
+        peers = await city.find(service)
+    except CapError:
+        return
+
+    # Criteri di ricerca (non dati personali): lingua e genere preferiti aiutano il partner
+    # a proporre il medico giusto invece di slot che il cittadino rifiuterebbe.
+    criteria = ""
+    lang = _lang(chat)
+    if lang and lang != "it":
+        criteria += f" lang={lang}"
+    gender = _gender(chat)
+    if gender:
+        criteria += f" gender_preference={gender}"
+
+    contacted = 0
+    for peer in peers:
+        peer_id = getattr(peer, "agent_id", "")
+        if not _bc_is_partner(city, peer_id):
+            continue
+        capabilities = getattr(peer, "capabilities", ())
+        if capabilities and service not in capabilities:
+            continue
+        if _bc_asked_partner(chat, city.agent_id, peer_id, procedure):
+            continue
+        request = (
+            f"need.request service_type={service} procedure={procedure} "
+            f"priority={priority} request_id={key}{criteria}"
+        )
+        if await _say(city, peer_id, request):
+            contacted += 1
+        if contacted >= 12:
+            break
+
+    # Il cittadino non resta senza risposta mentre aspettiamo i partner.
+    citizen = _citizen(chat)
+    if contacted and citizen:
+        note = _BC_SEARCHING_EN if lang and lang != "it" else _BC_SEARCHING_IT
+        if not any(
+            row.sender == city.agent_id and row.recipient == citizen and row.text == note
+            for row in chat
+        ):
+            await _say(city, citizen, note)
+
+
+_BC_SEARCHING_IT = (
+    "Nella nostra ASST non ci sono posti adatti alle sue preferenze entro la scadenza della "
+    "ricetta: sto chiedendo alle altre ASST e le invio le loro proposte appena arrivano."
+)
+_BC_SEARCHING_EN = (
+    "Our ASST has no free time that fits your preferences before your prescription deadline: "
+    "I am asking the other ASSTs and will send you their options as soon as they arrive."
+)
+
+
+def _bc_fits_citizen(chat: list[Message], doctor_id: str, hint: str = "") -> bool:
+    """Lingua e genere del medico dal registry (stessa tabella degli slot locali)."""
+    if not _speaks(doctor_id, _lang(chat), hint):
+        return False
+    gender = _gender(chat)
+    if gender:
+        spec = _DOCTORS.get(doctor_id.rsplit("-", 1)[-1])
+        if spec is None or spec[1] != gender:
+            return False
+    return True
+
+
+def _bc_latest_consent_request(chat: list[Message], agent: str, citizen: str) -> int:
+    """Posizione dell'ultima richiesta esplicita di consenso cross_asst."""
+    index = -1
+    for i, row in enumerate(chat):
+        if (
+            row.sender == agent and row.recipient == citizen
+            and first_word(row.text) == "consent"
+            and fields_of(row.text).get("purpose") == "cross_asst"
+        ):
+            index = i
+    return index
+
+
+def _bc_cross_ref(chat: list[Message], agent: str, citizen: str) -> str:
+    """Accetta solo il consent_ref ricevuto dopo un consenso cross_asst richiesto."""
+    request_index = _bc_latest_consent_request(chat, agent, citizen)
+    if request_index < 0:
+        return ""
+    for row in chat[request_index + 1:]:
+        if row.sender != citizen:
+            continue
+        data = fields_of(row.text)
+        if (
+            first_word(row.text) == "consent"
+            and data.get("consent_ref")
+            and data.get("purpose", "cross_asst") == "cross_asst"
+        ):
+            return data["consent_ref"]
+    return ""
+
+
+def _bc_recent_confirmation(chat: list[Message], citizen: str, before: int | None = None) -> Message | None:
+    rows = chat if before is None else chat[:before]
+    for row in reversed(rows):
+        if row.sender == citizen and first_word(row.text) == "confirm":
+            return row
+    return None
+
+
+async def _bc_forward_confirm(city: City, confirmation: Message, chat: list[Message]) -> None:
+    """Invia dati identificativi SOLO dopo un consenso cross-ASST valido."""
+    citizen = confirmation.sender
+    offer_id = fields_of(confirmation.text).get("offer_id", "")
+    offer = _our_offer(chat, city.agent_id, offer_id) if offer_id else {}
+    facility = offer.get("facility", "")
+    slot = offer.get("slot_id", "")
+    consent = _bc_cross_ref(chat, city.agent_id, citizen)
+    if not (offer_id and slot and consent and _bc_is_partner(city, facility)):
+        return
+    # Evita di utilizzare offerte mai ricevute dalla facility dichiarata.
+    if not _bc_asked_partner(chat, city.agent_id, facility, offer.get("procedure", "")):
+        return
+    if _we(chat, city.agent_id, f"slot_id={slot}", to=facility, word="confirm"):
+        return
+    parts = [
+        "confirm", f"offer_id={offer_id}", f"slot_id={slot}",
+        f"facility={facility}", f"citizen={citizen}",
+        f"consent_ref={consent}",
+    ]
+    number = offer.get("prescription_number") or _number(chat)
+    if number:
+        parts.append(f"prescription_number={number}")
+    await _say(city, facility, " ".join(parts))
+
+
+async def _bc_external_confirm(city: City, message: Message, chat: list[Message]) -> bool:
+    offer_id = fields_of(message.text).get("offer_id", "")
+    offer = _our_offer(chat, city.agent_id, offer_id) if offer_id else {}
+    if not _bc_partner_offer(city, chat, offer):
+        return False  # Lascia invariata la gestione del confirm del template.
+
+    citizen = message.sender
+    if _bc_cross_ref(chat, city.agent_id, citizen):
+        await _bc_forward_confirm(city, message, chat)
+        return True
+
+    if _bc_latest_consent_request(chat, city.agent_id, citizen) < 0:
+        await _say(
+            city, citizen,
+            "consent purpose=cross_asst Posso condividere con un'altra ASST "
+            "i dati necessari alla prenotazione?",
+        )
+    return True
+
+
+async def _bc_cross_reply(city: City, message: Message, chat: list[Message]) -> bool:
+    """Riprende il confirm sospeso dopo il consenso, o cancella l'offerta in caso di no."""
+    citizen = message.sender
+    request_index = _bc_latest_consent_request(chat, city.agent_id, citizen)
+    if request_index < 0:
+        return False
+    # Non consumare normali need.request che non sono risposte alla richiesta di consenso.
+    after = chat[request_index + 1:]
+    if not any(row.msg_id == message.msg_id for row in after):
+        return False
+    confirmation = _bc_recent_confirmation(chat, citizen, before=request_index)
+    if confirmation is None:
+        return False
+    offer_id = fields_of(confirmation.text).get("offer_id", "")
+    offer = _our_offer(chat, city.agent_id, offer_id)
+    if not _bc_partner_offer(city, chat, offer):
+        return False
+
+    if _bc_cross_ref(chat, city.agent_id, citizen):
+        await _bc_forward_confirm(city, confirmation, chat)
+    elif not _we(chat, city.agent_id, f"offer_id={offer_id}", to=citizen, word="cancel"):
+        # Il rifiuto in linguaggio naturale non fornisce consent_ref.
+        await _say(city, citizen, f"cancel offer_id={offer_id} reason=cross_asst_consent_declined")
+    return True
+
+
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+# Offerte dei partner ancora in piedi davanti al cittadino: oltre questo numero non se ne
+# inoltrano altre finché il cittadino non ne rifiuta qualcuna (niente raffiche di offerte).
+_BC_MAX_OPEN_PARTNER_OFFERS = 3
+
+
+def _bc_offer_lines(text: str) -> list[dict[str, str]]:
+    """Formato comune tra ASST: un solo messaggio, una riga ``offer`` per slot."""
+    rows = [fields_of(line) for line in text.splitlines() if first_word(line) == "offer"]
+    if not rows and first_word(text) == "offer":
+        rows = [fields_of(text)]
+    return rows
+
+
+def _bc_open_partner_offers(chat: list[Message], agent: str, citizen: str) -> int:
+    cancelled = {
+        fields_of(row.text).get("offer_id", "")
+        for row in chat
+        if row.sender == citizen and "cancel" in words(row.text)
+    }
+    count = 0
+    for row in chat:
+        if row.sender != agent or row.recipient != citizen or first_word(row.text) != "offer":
+            continue
+        info = fields_of(row.text)
+        if info.get("offer_id") not in cancelled and _bc_is_partner_id(info.get("facility", "")):
+            count += 1
+    return count
+
+
+def _bc_is_partner_id(agent_id: str) -> bool:
+    return agent_id.startswith("agent:") and agent_id not in _OUR_AGENTS
+
+
+async def _bc_external_offer(city: City, message: Message, chat: list[Message]) -> None:
+    """Inoltra offerte effettive di un partner interrogato, senza inventare attributi."""
+    if not _bc_is_partner(city, message.sender):
+        return
+    citizen = _citizen(chat)
+    if not citizen:
+        return
+    room = _BC_MAX_OPEN_PARTNER_OFFERS - _bc_open_partner_offers(chat, city.agent_id, citizen)
+    lines = []
+    for info in _bc_offer_lines(message.text):
+        line = _bc_partner_offer_line(city, message, chat, info)
+        if line is not None:
+            lines.append(line)
+    lines.sort(key=lambda item: item[0])
+    sent = _sent(message.need_id or message.msg_id)
+    for _, slot_id, text in lines[: max(room, 0)]:
+        if await _say(city, citizen, text):
+            sent.offers.add(slot_id)
+
+
+def _bc_partner_offer_line(
+    city: City, message: Message, chat: list[Message], info: dict[str, str]
+) -> tuple[datetime, str, str] | None:
+    """Una riga ``offer`` di un partner, validata; ``None`` se va scartata."""
+    procedure = info.get("procedure", "")
+    if not _bc_asked_partner(chat, city.agent_id, message.sender, procedure):
+        return None
+    rx = _ledger(chat, "prescription")
+    agenda = _ledger(chat, "agenda")
+    citizen = _citizen(chat)
+    now = _when((agenda or {}).get("agenda_now", ""))
+    at_text = info.get("agenda_date") or info.get("at", "")
+    at = _when(at_text)
+    if not rx or not citizen or not now or not at:
+        return None
+    if rx.get("procedure") != procedure or rx.get("state", "issued") != "issued":
+        return None
+    if info.get("facility") != message.sender:
+        return None
+    if any(not info.get(field) for field in ("offer_id", "slot_id", "doctor_id")):
+        return None
+    # agenda_day ed expiry sono facoltativi nel formato comune: si ricavano dalla data.
+    day = info.get("agenda_day") or _WEEKDAYS[at.weekday()]
+    expiry_text = info.get("expiry") or at_text
+
+    priority = rx.get("priority", "")
+    if at <= now + _LEAD:
+        return None
+    if priority == "U" and at.date() != now.date():
+        return None
+    if priority in _DEADLINE_DAYS and at >= now + timedelta(days=_DEADLINE_DAYS[priority]):
+        return None
+    if info.get("urgent_reserve", "").lower() == "true" and priority != "U":
+        return None
+    if info.get("free", "1") == "0":
+        return None
+    expiry = _when(expiry_text)
+    if expiry is None or expiry <= now:
+        return None
+    # Mai inoltrare un medico che non parla la lingua del cittadino (o del genere sbagliato):
+    # il cittadino lo rifiuterebbe e il percorso resterebbe aperto. doctor_lang del partner
+    # serve solo come indizio per le lingue rare e non viene mai scritto al cittadino.
+    if not _bc_fits_citizen(chat, info["doctor_id"], info.get("doctor_lang", "")):
+        return None
+
+    offer_id = info["offer_id"]
+    if _our_offer(chat, city.agent_id, offer_id):
+        return None
+    if _we(chat, city.agent_id, f"slot_id={info['slot_id']}", to=citizen, word="offer"):
+        return None
+    fields = [
+        "offer", f"offer_id={offer_id}", f"slot_id={info['slot_id']}",
+        f"doctor_id={info['doctor_id']}", f"facility={message.sender}",
+        f"procedure={procedure}", f"agenda_date={at_text}",
+        f"agenda_day={day}", f"expiry={expiry_text}",
+        f"priority={priority}",
+    ]
+    number = _number(chat)
+    if number:
+        fields.append(f"prescription_number={number}")
+    return at, info["slot_id"], " ".join(fields)
+
+
+# --- strutture: risposta alle richieste dei partner (formato comune tra ASST) ---------------
+# need.request da un centro prenotazioni di un'altra ASST -> UN solo messaggio, una riga offer
+# per slot libero nostro (dal Ledger), oppure cancel reason=... request_id=...
+
+_FAC_PROCEDURES = {
+    "hospital": ("VIS-FIS",),
+    "specialist_care": ("VIS-CARD", "CTRL-CARD"),
+    "family_counseling": ("CONS-GIN",),
+}
+_FAC_WHEELCHAIR = {"hospital"}  # dal registry della console: solo l'ospedale è accessibile
+_FAC_MAX_LINES = 5
+
+
+def _fac_doctor_lang(doctor_id: str) -> str:
+    spec = _DOCTORS.get(doctor_id.rsplit("-", 1)[-1])
+    if spec is None:
+        return ""
+    rare = _RARE_BY_ASST.get(_asst_of(doctor_id), "")
+    langs = [rare if lang == "*" else lang for lang in sorted(spec[0], key=lambda x: (x != "it", x))]
+    return "/".join(lang for lang in langs if lang)
+
+
+def _fac_partner_request(message: Message) -> bool:
+    return (
+        message.sender.startswith("agent:")
+        and message.sender not in _OUR_AGENTS
+        and first_word(message.text) == "need.request"
+    )
+
+
+async def _fac_answer_partner(city: City, message: Message, chat: list[Message], role: str) -> None:
+    """Risponde in un solo messaggio: righe offer con i nostri slot liberi, o cancel."""
+    partner = message.sender
+    info = fields_of(message.text)
+    request_id = info.get("request_id") or message.need_id or message.msg_id
+    tag = f"request_id={request_id}"
+    if _we(chat, city.agent_id, tag, to=partner, word="offer") or _we(
+        chat, city.agent_id, tag, to=partner, word="cancel"
+    ):
+        return
+    procedure = info.get("procedure", "")
+    priority = info.get("priority") or None
+    if procedure not in _FAC_PROCEDURES.get(role, ()):
+        await _say(city, partner, f"cancel reason=no_availability {tag}")
+        return
+    asked = f"world procedure={procedure} facility={city.agent_id} page=1"
+    if not _exact(chat, city.agent_id, "agenda"):
+        await _say(city, LEDGER, "agenda")
+    if not _exact(chat, city.agent_id, asked):
+        await _say(city, LEDGER, asked)
+    fresh = await _until(
+        city, message.need_id, chat,
+        lambda rows: _has_agenda(rows) and _latest_slots(rows) is not None,
+    )
+    agenda = _ledger(fresh, "agenda")
+    now = _when("" if agenda is None else agenda.get("agenda_now", ""))
+    world = _latest_slots(fresh)
+    if now is None or world is None:
+        await _say(city, partner, f"cancel reason=facility_unavailable {tag}")
+        return
+    lang = info.get("lang") or "it"  # senza lingua richiesta: tutti i medici parlano italiano
+    gender = info.get("gender_preference") or info.get("gender")
+    slots = fitting(
+        [line for line in world.splitlines() if "slot_id=" in line],
+        now=now,
+        priority=priority,
+        lang=lang,
+        gender=gender if gender in {"m", "f"} else None,
+        facility=city.agent_id,
+        procedure=procedure,
+    )[:_FAC_MAX_LINES]
+    if not slots:
+        await _say(city, partner, f"cancel reason=no_availability {tag}")
+        return
+    rows = []
+    for slot in slots:
+        doctor = slot["doctor_id"]
+        spec = _DOCTORS.get(doctor.rsplit("-", 1)[-1])
+        parts = [
+            "offer", f"offer_id=of-{slot['slot_id']}", f"slot_id={slot['slot_id']}",
+            f"doctor_id={doctor}", f"facility={city.agent_id}", f"procedure={procedure}",
+            f"agenda_date={slot['at']}", f"agenda_day={slot.get('day', '')}",
+            f"expiry={slot['at']}",
+        ]
+        doctor_lang = _fac_doctor_lang(doctor)
+        if doctor_lang:
+            parts.append(f"doctor_lang={doctor_lang}")
+        if spec is not None:
+            parts.append(f"doctor_gender={spec[1]}")
+        if priority:
+            parts.append(f"priority={priority}")
+        parts.append(tag)
+        if role in _FAC_WHEELCHAIR:
+            parts.append("wheelchair=true")
+        rows.append(" ".join(parts))
+    while len(rows) > 1 and len("\n".join(rows)) > 1900:  # limite di 2000 caratteri per messaggio
+        rows.pop()
+    await _say(city, partner, "\n".join(rows))
 
 
 # --- facility ----------------------------------------------------------------------------------
