@@ -1288,6 +1288,9 @@ async def _bc_external_offer(city: City, message: Message, chat: list[Message]) 
     citizen = _citizen(chat)
     if not citizen:
         return
+    sent = _sent(message.need_id or message.msg_id)
+    if _bc_offer_pending(chat, city.agent_id, citizen, sent.offers):
+        return
     room = _BC_MAX_OPEN_PARTNER_OFFERS - _bc_open_partner_offers(chat, city.agent_id, citizen)
     lines = []
     for info in _bc_offer_lines(message.text):
@@ -1295,7 +1298,6 @@ async def _bc_external_offer(city: City, message: Message, chat: list[Message]) 
         if line is not None:
             lines.append(line)
     lines.sort(key=lambda item: item[0])
-    sent = _sent(message.need_id or message.msg_id)
     for _, slot_id, text in lines[: max(room, 0)]:
         if await _say(city, citizen, text):
             sent.offers.add(slot_id)
@@ -1350,12 +1352,7 @@ def _bc_partner_offer_line(
     if _our_offer(chat, city.agent_id, offer_id):
         return None
     if _we(chat, city.agent_id, f"slot_id={info['slot_id']}", to=citizen, word="offer"):
-        return
-
-    # Evita invii concorrenti di offerte esterne multiple: se c'e' gia' un'offerta attiva, non mandarne altre
-    sent = _sent(message.need_id or message.msg_id)
-    if _bc_offer_pending(chat, city.agent_id, citizen, sent.offers):
-        return
+        return None
 
     fields = [
         "offer", f"offer_id={offer_id}", f"slot_id={info['slot_id']}",
@@ -1372,12 +1369,11 @@ def _bc_partner_offer_line(
     courtesy = _bc_offer_courtesy(
         lang == "en",
         procedure,
-        info.get("agenda_day", ""),
+        day,
         at_text,
     )
     full_text = f"{act}\n{courtesy}" if courtesy else act
-    if await _say(city, citizen, full_text):
-        _sent(message.need_id or message.msg_id).offers.add(info["slot_id"])
+    return at, info["slot_id"], full_text
 
 
 # --- facility ----------------------------------------------------------------------------------
