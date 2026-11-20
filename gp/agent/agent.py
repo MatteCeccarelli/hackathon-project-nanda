@@ -51,6 +51,10 @@ _RED_FLAGS = (
     "loss of strength in the legs",
     "dolore al petto",
     "chest pain",
+    "dolore toracico",
+    "fitta al petto",
+    "fitte al petto",
+    "senza forze alle gambe",
 )
 _DEADLINE_DAYS = {"B": 2, "D": 5}
 _RX = re.compile(r"^prescription_number-[A-Z0-9-]{4,40}$")
@@ -455,10 +459,40 @@ async def _gp(city: City, message: Message, chat: list[Message]) -> None:
             return
     if _we(chat, agent, token, to=message.sender, word="prescription"):
         return
+
+    # Clinical empathy & guidance using City LLM Gateway (healthcare skill pattern)
+    proc_label = "cardiologica" if "CARD" in procedure else "fisiatrica"
+    paziente_msg = message.text or "richiesta di consulto"
+    line = (
+        f"Buongiorno, ho valutato la sua richiesta ed emesso la prescrizione per visita {proc_label}. "
+        "Contatti il Centro Prenotazioni per concordare l'appuntamento."
+    )
+    try:
+        ans = await city.llm(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Sei il Medico di Medicina Generale (MMG) di un'ASST. "
+                        "Rispondi al paziente in una sola frase breve (massimo 25 parole), empatica e rassicurante in italiano. "
+                        f"Riconosci con calore il sintomo descritto, conferma l'emissione della ricetta per visita {proc_label} prioritaria "
+                        "e invitalo con chiarezza a rivolgersi al Centro Prenotazioni per prenotare la visita. "
+                        "REGOLE ASSOLUTE: NON formulare diagnosi cliniche definitive, NON prescrivere o nominare farmaci o dosaggi."
+                    ),
+                },
+                {"role": "user", "content": paziente_msg},
+            ]
+        )
+        content = ans.get("content", "").strip().replace("\n", " ")
+        if content:
+            line = content
+    except Exception as exc:
+        _LOG.info("gp.llm.fallback", extra={"error": str(exc)})
+
     await _say(
         city,
         message.sender,
-        f"prescription {token} procedure={procedure} priority={priority}",
+        f"{line} prescription {token} procedure={procedure} priority={priority}",
     )
 
 
