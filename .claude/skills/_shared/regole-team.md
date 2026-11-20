@@ -29,6 +29,8 @@ Valgono per entrambe le skill. Il contesto completo è in `docs/MACH_contesto_te
 - `city run` non certifica: la conformance vera la fa `city deploy`.
 
 ## Deploy
+- **`/hot-fix` e `/feature` si fermano al push su main: non fanno deploy.** Il team raccoglie più modifiche su main e chiede il deploy esplicitamente, con una richiesta a parte ("deploya gli agenti modificati"). Le regole qui sotto valgono per quella richiesta.
+- Per sapere cosa deployare: confronta la versione in servizio (`city status <agente>`) con i commit su main che toccano `<agente>/agent/agent.py` dopo l'ultimo bump di `card.yaml`; elenca al team gli agenti da deployare prima di partire.
 - **Mai senza conferma esplicita del team.** Mai `city retire` o `city delete`.
 - Un agente alla volta per cartella; mai due deploy contemporanei dello **stesso** agente. Agenti diversi si possono deployare in parallelo.
 - Ordine se si deployano più agenti: `specialist` prima di `hospital`; priorità ai ruoli a cui arrivano i cittadini (`gp`, `booking_centre`, `family_counseling`).

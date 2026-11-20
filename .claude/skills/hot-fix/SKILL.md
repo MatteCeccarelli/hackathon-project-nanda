@@ -1,6 +1,6 @@
 ---
 name: hot-fix
-description: Correzione rapida di un agente ASST direttamente su main (bug, penalità vista in Journeys, regola cambiata). Usala quando il team scrive /hot-fix o chiede di "sistemare al volo", "correggere subito" un agente già in gara.
+description: Correzione rapida di un agente ASST direttamente su main (bug, penalità vista in Journeys, regola cambiata), fino al push; il deploy si fa a parte, su richiesta del team. Usala quando il team scrive /hot-fix o chiede di "sistemare al volo", "correggere subito" un agente già in gara.
 ---
 
 # /hot-fix — correzione rapida su main
@@ -32,20 +32,20 @@ Prima di iniziare leggi le regole comuni in [../_shared/regole-team.md](../_shar
 
 5. **Commit su main** (solo i file toccati, mai `.DS_Store` o `__pycache__`), con un messaggio che dice problema e soluzione. **Non fare ancora push.**
 
-6. **Riassunto e richiesta di deploy.** Scrivi al team:
+6. **Riassunto e richiesta di push.** Scrivi al team:
    - **Problema**: cosa succedeva, su quale agente, quale riga di rubrica / penalità era in gioco.
    - **Causa**.
    - **Soluzione**: cosa hai cambiato e perché è la modifica minima.
    - **Test fatti** e cosa non è stato possibile testare in locale.
-   - **Rischio** se si deploya e se non si deploya.
+   - **Rischio** del cambiamento.
 
-   Poi **chiedi esplicitamente se puoi fare push e deploy**. Fermati e aspetta la risposta.
+   Poi **chiedi esplicitamente se puoi fare push su main**. Fermati e aspetta la risposta.
 
 7. **Solo dopo un sì esplicito:**
    ```bash
    git pull --ff-only origin main   # se nel frattempo è cambiato qualcosa: conflitti → fermati e chiedi
    git push origin main
    ```
-   Poi deploy dell'agente come da regole comuni (sezione "Deploy"), verifica con `city status <agente>`, commit e push del bump di versione in `card.yaml`.
+   **Non fare il deploy.** Il team raccoglie più hot-fix e feature su main e chiede il deploy a parte, quando decide (vedi regole comuni, sezione "Deploy"). Nel riassunto finale ricorda quali agenti hanno modifiche su main non ancora deployate.
 
-8. **Aggiorna il contesto**: aggiungi una riga alla **sezione 12** di `docs/MACH_contesto_team.md` (Tipo = `hot-fix`), e se serve una riga alla sezione 9 (log LIVE) o a "Regole e penalità scoperte". Linguaggio non tecnico, con il **perché**. Commit e push su main. Mostra la riga al team perché la rilegga.
+8. **Aggiorna il contesto**: aggiungi una riga alla **sezione 12** di `docs/MACH_contesto_team.md` (Tipo = `hot-fix`, Versione deployata = `in main, da deployare`), e se serve una riga alla sezione 9 (log LIVE) o a "Regole e penalità scoperte". Linguaggio non tecnico, con il **perché**. Commit e push su main. Mostra la riga al team perché la rilegga.

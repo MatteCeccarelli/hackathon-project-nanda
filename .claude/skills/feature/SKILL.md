@@ -1,6 +1,6 @@
 ---
 name: feature
-description: Nuova funzionalità per uno o più agenti ASST su un branch dedicato, con revisione del team prima di merge e deploy. Usala quando il team scrive /feature o chiede di "implementare", "aggiungere" un comportamento nuovo agli agenti.
+description: Nuova funzionalità per uno o più agenti ASST su un branch dedicato, con revisione del team prima del merge in main; il deploy si fa a parte, su richiesta del team. Usala quando il team scrive /feature o chiede di "implementare", "aggiungere" un comportamento nuovo agli agenti.
 ---
 
 # /feature — nuova funzionalità su branch
@@ -46,7 +46,7 @@ Prima di iniziare leggi le regole comuni in [../_shared/regole-team.md](../_shar
    - test fatti e cosa non è testabile in locale;
    - rischi.
 
-   Poi **chiedi se ci sono altre modifiche da fare o cose da implementare**. Se il team chiede modifiche, torna al passo 5. Non fare merge né deploy senza conferma esplicita.
+   Poi **chiedi se ci sono altre modifiche da fare o cose da implementare**. Se il team chiede modifiche, torna al passo 5. Non fare merge senza conferma esplicita.
 
 7. **Dopo la conferma esplicita**, merge in main:
    ```bash
@@ -62,6 +62,6 @@ Prima di iniziare leggi le regole comuni in [../_shared/regole-team.md](../_shar
    git push origin --delete feature/<...>
    ```
 
-8. **Deploy** degli agenti toccati come da regole comuni (sezione "Deploy"), verifica con `city status <agente>`, commit e push su main del bump di versione in `card.yaml`.
+8. **Non fare il deploy.** Il team raccoglie più hot-fix e feature su main e chiede il deploy a parte, quando decide (vedi regole comuni, sezione "Deploy"). Nel riassunto finale indica quali agenti hanno modifiche su main non ancora deployate.
 
-9. **Aggiorna il contesto**: aggiungi una riga alla **sezione 12** di `docs/MACH_contesto_team.md` (Tipo = `feature`), e se serve aggiorna le sezioni 9 e 11 ("Note per il pitch"). Linguaggio non tecnico, con il **perché** e il pilastro (accessibilità, mobilità, ambiente) o criterio coperto. Commit e push su main. Mostra la riga al team perché la rilegga.
+9. **Aggiorna il contesto**: aggiungi una riga alla **sezione 12** di `docs/MACH_contesto_team.md` (Tipo = `feature`, Versione deployata = `in main, da deployare`), e se serve aggiorna le sezioni 9 e 11 ("Note per il pitch"). Linguaggio non tecnico, con il **perché** e il pilastro (accessibilità, mobilità, ambiente) o criterio coperto. Commit e push su main. Mostra la riga al team perché la rilegga.
