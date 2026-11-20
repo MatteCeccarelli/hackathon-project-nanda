@@ -38,6 +38,8 @@ Valgono per entrambe le skill. Il contesto completo è in `docs/MACH_contesto_te
   - `Released ...` → ok. Verifica `city status <agente>` (deve dire `visible` con la nuova versione).
   - `conformance FAIL · health: p99` o `ingress route did not become ready` → problema del server: rilancia.
   - `UPSTREAM_TIMEOUT ... still running` → **prima** controlla `city status <agente>`: spesso il deploy finisce lato server. Rilancia solo se non risulta.
+  - `QUOTA_EXCEEDED a team can deploy once every 5 minutes` → limite **per squadra**, non per agente: aspetta il tempo indicato e rilancia. Se più persone devono deployare, mettetevi d'accordo sull'ordine.
+- Se `card.yaml` ha ancora la stessa versione già in servizio (succede dopo un `UPSTREAM_TIMEOUT`, quando la CLI non fa il bump), portala avanti di una patch prima del deploy successivo.
 - Dopo un deploy riuscito: `git add <agente>/card.yaml`, commit ("<agente>: card portata a X dopo il deploy di Y"), push sul branch corrente.
 - Rollback se una versione peggiora: `city rollback agent:<slug> --to <versione>`.
 
