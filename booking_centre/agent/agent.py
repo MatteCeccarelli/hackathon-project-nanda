@@ -357,6 +357,13 @@ _RARE_BY_ASST = {
     "nord": "ur",
     "gorla": "sq",
     "brera": "fa",
+    "precotto": "ro",
+    "corvetto": "fr",
+    "isola": "tl",
+    "greco": "si",
+    "bicocca": "ti",
+    "lambrate": "ja",
+    "forlanini": "de",
 }
 
 
@@ -791,7 +798,11 @@ async def _desk(
         if _ledger(chat, "committed") is not None and "booking.receipt" not in words(message.text):
             return
         if message.sender.startswith("agent:") and _bc_offer_lines(message.text):
-            await _bc_external_offer(city, message, chat)
+            # MACH-1.1: "cancel reason=slot_taken offer_id=..." seguito dalle offerte rimaste,
+            # nello stesso messaggio: prima si ritira l'offerta persa, poi si leggono le altre.
+            withdrawn = await _bc_partner_cancel_lines(city, message, chat)
+            # I cancel appena mandati entrano nel thread: l'offerta ritirata non blocca le nuove.
+            await _bc_external_offer(city, message, [*chat, *withdrawn])
             return
         if (
             message.sender.startswith("agent:")
@@ -1047,10 +1058,17 @@ async def _on_confirm(
     agent = city.agent_id
     fields = fields_of(message.text)
     offer_id = fields.get("offer_id", "")
-    consent = fields.get("consent_ref", "")
+    consent = fields.get("consent_ref") or fields.get("cross_asst_consent_ref", "")
     offer = _our_offer(chat, agent, offer_id) if offer_id else {}
     slot = fields.get("slot_id") or offer.get("slot_id", "")
     facility = fields.get("facility") or offer.get("facility", "")
+    if _fac_is_partner_confirm(message, agent):
+        problem = _fac_confirm_problem(chat, agent, message, slot, consent)
+        if problem:
+            if not _we(chat, agent, f"offer_id={offer_id}", to=message.sender, word="cancel"):
+                tag = f" request_id={fields['request_id']}" if fields.get("request_id") else ""
+                await _say(city, message.sender, f"cancel offer_id={offer_id} reason={problem}{tag}")
+            return
     if not slot or not consent:
         return
     citizen = fields.get("citizen") or (
@@ -1216,6 +1234,9 @@ async def _bc_discover(
 
     request_id = f"{key}.{retry_offer}" if retry_offer else key
     contacted = 0
+    # MACH-1.1: con una lingua rara si scrive PRIMA all'ASST che la parla, poi ai partner che
+    # hanno pubblicato i loro id (fidati), infine agli altri trovati sull'Index.
+    peers = sorted(peers, key=lambda peer: _bc_peer_rank(getattr(peer, "agent_id", ""), lang))
     for peer in peers:
         peer_id = getattr(peer, "agent_id", "")
         if not _bc_is_partner(city, peer_id):
@@ -1250,6 +1271,62 @@ async def _bc_discover(
 
 
 _BC_MAX_PARTNERS_LANG = 40
+
+# Id degli agenti pubblicati dalle squadre su Discord (MACH-1.1, "Fiducia"). Sono dichiarazioni
+# non verificate: servono solo a decidere l'ORDINE in cui chiedere, non a fidarsi dei dati.
+# Il controllo vero resta: si accettano offerte solo da chi abbiamo interrogato noi e con
+# facility uguale al mittente.
+_PUBLISHED_IDS: dict[str, frozenset[str]] = {
+    "lorenteggio": frozenset({"agent:qtjne8symjas", "agent:w2qsptc9qqhg", "agent:tmt0bcv0st1f", "agent:n9bf9y6670hp", "agent:mcppmrbjvxag"}),
+    "giambellino": frozenset({"agent:cdc7x6m21nj6", "agent:c32jyk0cyan7", "agent:h6r1v45esk77", "agent:hnpe58epeyh1", "agent:bzs050xacs1m"}),
+    "lambrate": frozenset({"agent:gdrf9b9kxxss", "agent:c2ewegr2ea3v", "agent:nanpr5mgm2py", "agent:pky3vqyqbepa", "agent:atp772whjkgd"}),
+    "nord": frozenset({"agent:psxp8bh1feaa", "agent:wwxaphfb5pfh", "agent:gpr1zqe343gb", "agent:zand0f57ec1j", "agent:ccjzqm7yekwx"}),
+    "greco": frozenset({"agent:h3n6kfd18r3g", "agent:bmrcsmqq6at2", "agent:xtj1dk9x3qej", "agent:q18es2d82f8r", "agent:pxvd2kk2yx5j"}),
+    "bicocca": frozenset({"agent:ez8cb7j167p2", "agent:rng5wcrzvhsj", "agent:bb01ggxymm05", "agent:sh35cbsy287d", "agent:nkh372rd16yq"}),
+    "bovisa": frozenset({"agent:vgtmj5nqfkxj", "agent:h82xpx3rkn9e", "agent:gxq3vzgt3h5t", "agent:tty8erdj6t41", "agent:txar5994gbkj"}),
+    "isola": frozenset({"agent:etpwrfmfa8hm", "agent:mkfzagfe8jtt"}),
+}
+_PUBLISHED_ALL = frozenset().union(*_PUBLISHED_IDS.values())
+
+
+def _bc_peer_rank(agent_id: str, lang: str) -> int:
+    """0 = ASST che parla la lingua rara richiesta, 1 = id pubblicato, 2 = altri."""
+    if lang and lang not in {"it", "en"}:
+        for asst, rare in _RARE_BY_ASST.items():
+            if rare == lang and agent_id in _PUBLISHED_IDS.get(asst, frozenset()):
+                return 0
+    return 1 if agent_id in _PUBLISHED_ALL else 2
+
+
+async def _bc_partner_cancel_lines(
+    city: City, message: Message, chat: list[Message]
+) -> list[Message]:
+    """Righe ``cancel offer_id=...`` di un partner su offerte che abbiamo girato al cittadino.
+    Restituisce i cancel mandati, come righe del thread."""
+    citizen = _citizen(chat)
+    sent: list[Message] = []
+    if not citizen:
+        return sent
+    for line in message.text.splitlines():
+        if first_word(line) != "cancel":
+            continue
+        fields = fields_of(line)
+        offer_id = fields.get("offer_id", "")
+        offer = _our_offer(chat, city.agent_id, offer_id) if offer_id else {}
+        if not offer or offer.get("facility") != message.sender:
+            continue
+        if _we(chat, city.agent_id, f"offer_id={offer_id}", to=citizen, word="cancel"):
+            continue
+        reason = fields.get("reason", "facility_cancelled")
+        text = f"cancel offer_id={offer_id} reason={reason}"
+        if await _say(city, citizen, text):
+            sent.append(
+                Message(
+                    type="chat", sender=city.agent_id, msg_id=f"local-cancel-{offer_id}",
+                    need_id=message.need_id, body={"text": text}, recipient=citizen,
+                )
+            )
+    return sent
 
 _BC_WAITLIST_IT = (
     "Nessuna ASST mi ha proposto per ora un medico adatto alle sue preferenze entro la scadenza: "
@@ -1367,15 +1444,28 @@ async def _bc_forward_confirm(city: City, confirmation: Message, chat: list[Mess
         return
     if _we(chat, city.agent_id, f"slot_id={slot}", to=facility, word="confirm"):
         return
+    # MACH-1.1: consent_ref e' il consenso cross_asst; cross_asst_consent_ref (nome MACH-1)
+    # con lo stesso valore per i partner fermi alla versione precedente.
     parts = [
         "confirm", f"offer_id={offer_id}", f"slot_id={slot}",
-        f"facility={facility}", f"citizen={citizen}",
-        f"consent_ref={consent}",
+        f"consent_ref={consent}", f"cross_asst_consent_ref={consent}",
     ]
+    request_id = _bc_request_id_to(chat, city.agent_id, facility)
+    if request_id:
+        parts.append(f"request_id={request_id}")
     number = offer.get("prescription_number") or _number(chat)
     if number:
         parts.append(f"prescription_number={number}")
+    parts += [f"citizen={citizen}", f"facility={facility}"]
     await _say(city, facility, " ".join(parts))
+
+
+def _bc_request_id_to(chat: list[Message], agent: str, partner: str) -> str:
+    """request_id dell'ultima need.request mandata a quel partner."""
+    for row in reversed(chat):
+        if row.sender == agent and row.recipient == partner and first_word(row.text) == "need.request":
+            return fields_of(row.text).get("request_id", "")
+    return ""
 
 
 async def _bc_external_confirm(city: City, message: Message, chat: list[Message]) -> bool:
@@ -1511,11 +1601,69 @@ async def _bc_ask_renewal(
 
 
 def _cancel_reason(chat: list[Message]) -> str:
-    """Motivo dell'annullamento visto dalla struttura: ricetta scaduta o generico (ultimo rifiuto)."""
+    """Motivo (MACH-1.1) dell'ultimo rifiuto del Ledger, con ledger_code quando serve."""
     refusals = [row for row in chat if row.sender == LEDGER and first_word(row.text) == "refused"]
-    if refusals and "PRESCRIPTION_EXPIRED" in refusals[-1].text:
+    if not refusals:
+        return "facility_cancelled"
+    text = refusals[-1].text
+    if "PRESCRIPTION_EXPIRED" in text:
         return "prescription_expired"
-    return "facility_cancelled"
+    if "CONSENT_MISSING" in text:
+        return "consent_missing"
+    fields = fields_of(text)
+    code = fields.get("code") or fields.get("reason") or ""
+    if code in {"HELD", "ALREADY_HELD", "TAKEN", "SLOT_TAKEN", "CONFLICT"}:
+        return f"slot_taken ledger_code={code}"
+    return f"hold_refused ledger_code={code}" if code else "hold_refused"
+
+
+def _fac_is_partner_confirm(message: Message, agent: str) -> bool:
+    return (
+        message.sender.startswith("agent:")
+        and message.sender != agent
+        and message.sender not in _OUR_AGENTS
+    )
+
+
+def _fac_confirm_problem(
+    chat: list[Message], agent: str, message: Message, slot: str, consent: str
+) -> str:
+    """MACH-1.1: senza consenso niente hold; confirm su un'offerta mai mandata a quel partner."""
+    if not consent:
+        return "consent_missing"
+    offered = [
+        fields_of(line)
+        for row in chat
+        if row.sender == agent and row.recipient == message.sender
+        for line in row.text.splitlines()
+        if first_word(line) == "offer"
+    ]
+    if offered and slot not in {info.get("slot_id") for info in offered}:
+        return "not_offered"
+    return ""
+
+
+def _fac_receipt_extra(chat: list[Message], agent: str, slot: str, target: str) -> str:
+    """Campi MACH-1.1 della ricevuta verso un centro prenotazioni partner."""
+    if not target.startswith("agent:") or target in _OUR_AGENTS:
+        return ""
+    info: dict[str, str] = {}
+    for row in chat:
+        for line in row.text.splitlines():
+            fields = fields_of(line)
+            if fields.get("slot_id") != slot:
+                continue
+            if row.sender == agent and first_word(line) == "offer":
+                info.update({k: v for k, v in fields.items() if k in {"offer_id", "doctor_id", "agenda_date", "request_id"}})
+            if row.sender == target and first_word(line) == "confirm":
+                info.update({k: v for k, v in fields.items() if k in {"offer_id", "request_id"}})
+    parts = [f"offer_id={info['offer_id']}"] if info.get("offer_id") else []
+    parts.append(f"slot_id={slot}")
+    for key in ("request_id", "doctor_id", "agenda_date"):
+        if info.get(key):
+            parts.append(f"{key}={info[key]}")
+    parts.append(f"facility={agent}")
+    return " " + " ".join(parts)
 
 
 _WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
@@ -1687,6 +1835,7 @@ _FAC_PROCEDURES = {
 }
 _FAC_WHEELCHAIR = {"hospital"}  # dal registry della console: solo l'ospedale è accessibile
 _FAC_MAX_LINES = 5
+_FAC_ACK = "Ricevuto, verifico la disponibilità."
 
 
 def _fac_doctor_lang(doctor_id: str) -> str:
@@ -1719,8 +1868,11 @@ async def _fac_answer_partner(city: City, message: Message, chat: list[Message],
     procedure = info.get("procedure", "")
     priority = info.get("priority") or None
     if procedure not in _FAC_PROCEDURES.get(role, ()):
-        await _say(city, partner, f"cancel reason=no_availability {tag}")
+        await _say(city, partner, f"cancel reason=procedure_not_offered {tag}")
         return
+    # MACH-1.1: prima risposta entro 10 s; riga senza atto ne' token, ignorata dai parser.
+    if not _exact(chat, city.agent_id, _FAC_ACK):
+        await _say(city, partner, _FAC_ACK)
     asked = f"world procedure={procedure} facility={city.agent_id} page=1"
     if not _exact(chat, city.agent_id, "agenda"):
         await _say(city, LEDGER, "agenda")
@@ -1841,7 +1993,7 @@ def _booking_of(chat: list[Message], agent: str, slot_id: str) -> tuple[str, str
         fields = fields_of(row.text)
         if "confirm" in words(row.text) and row.sender not in (LEDGER, agent):
             sender = row.sender
-            consent = fields.get("consent_ref", consent)
+            consent = fields.get("consent_ref") or fields.get("cross_asst_consent_ref") or consent
             number = fields.get("prescription_number") or number
         if row.sender == agent and "hold" in words(row.text):
             consent = fields.get("consent_ref", consent)
@@ -1961,7 +2113,8 @@ async def _on_committed(city: City, message: Message, chat: list[Message]) -> No
     token = f"booking_id={booking_id}"
     if _we(chat, city.agent_id, token, to=target, word="booking.receipt"):
         return
-    await _say(city, target, f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}")
+    extra = _fac_receipt_extra(chat, city.agent_id, slot, target) if slot else ""
+    await _say(city, target, f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}{extra}")
 
 
 async def _on_refused(
@@ -1984,7 +2137,12 @@ async def _on_refused(
         and offer_id
         and not _we(chat, agent, f"offer_id={offer_id}", to=target, word="cancel")
     ):
-        await _say(city, target, f"cancel offer_id={offer_id} reason={_cancel_reason(chat)}")
+        tag = ""
+        if target.startswith("agent:") and target not in _OUR_AGENTS:
+            rid = _fac_receipt_extra(chat, agent, slot, target)
+            rid_fields = fields_of(rid)
+            tag = f" request_id={rid_fields['request_id']}" if rid_fields.get("request_id") else ""
+        await _say(city, target, f"cancel offer_id={offer_id} reason={_cancel_reason(chat)}{tag}")
     if hold_self:
         await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
 

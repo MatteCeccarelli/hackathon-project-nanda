@@ -343,6 +343,13 @@ _RARE_BY_ASST = {
     "nord": "ur",
     "gorla": "sq",
     "brera": "fa",
+    "precotto": "ro",
+    "corvetto": "fr",
+    "isola": "tl",
+    "greco": "si",
+    "bicocca": "ti",
+    "lambrate": "ja",
+    "forlanini": "de",
 }
 
 
@@ -902,10 +909,17 @@ async def _on_confirm(
     agent = city.agent_id
     fields = fields_of(message.text)
     offer_id = fields.get("offer_id", "")
-    consent = fields.get("consent_ref", "")
+    consent = fields.get("consent_ref") or fields.get("cross_asst_consent_ref", "")
     offer = _our_offer(chat, agent, offer_id) if offer_id else {}
     slot = fields.get("slot_id") or offer.get("slot_id", "")
     facility = fields.get("facility") or offer.get("facility", "")
+    if _fac_is_partner_confirm(message, agent):
+        problem = _fac_confirm_problem(chat, agent, message, slot, consent)
+        if problem:
+            if not _we(chat, agent, f"offer_id={offer_id}", to=message.sender, word="cancel"):
+                tag = f" request_id={fields['request_id']}" if fields.get("request_id") else ""
+                await _say(city, message.sender, f"cancel offer_id={offer_id} reason={problem}{tag}")
+            return
     if not slot or not consent:
         return
     citizen = fields.get("citizen") or (
@@ -1352,6 +1366,7 @@ _FAC_PROCEDURES = {
 }
 _FAC_WHEELCHAIR = {"hospital"}  # dal registry della console: solo l'ospedale è accessibile
 _FAC_MAX_LINES = 5
+_FAC_ACK = "Ricevuto, verifico la disponibilità."
 
 
 def _fac_doctor_lang(doctor_id: str) -> str:
@@ -1384,8 +1399,11 @@ async def _fac_answer_partner(city: City, message: Message, chat: list[Message],
     procedure = info.get("procedure", "")
     priority = info.get("priority") or None
     if procedure not in _FAC_PROCEDURES.get(role, ()):
-        await _say(city, partner, f"cancel reason=no_availability {tag}")
+        await _say(city, partner, f"cancel reason=procedure_not_offered {tag}")
         return
+    # MACH-1.1: prima risposta entro 10 s; riga senza atto ne' token, ignorata dai parser.
+    if not _exact(chat, city.agent_id, _FAC_ACK):
+        await _say(city, partner, _FAC_ACK)
     asked = f"world procedure={procedure} facility={city.agent_id} page=1"
     if not _exact(chat, city.agent_id, "agenda"):
         await _say(city, LEDGER, "agenda")
@@ -1506,7 +1524,7 @@ def _booking_of(chat: list[Message], agent: str, slot_id: str) -> tuple[str, str
         fields = fields_of(row.text)
         if "confirm" in words(row.text) and row.sender not in (LEDGER, agent):
             sender = row.sender
-            consent = fields.get("consent_ref", consent)
+            consent = fields.get("consent_ref") or fields.get("cross_asst_consent_ref") or consent
             number = fields.get("prescription_number") or number
         if row.sender == agent and "hold" in words(row.text):
             consent = fields.get("consent_ref", consent)
@@ -1626,15 +1644,74 @@ async def _on_committed(city: City, message: Message, chat: list[Message]) -> No
     token = f"booking_id={booking_id}"
     if _we(chat, city.agent_id, token, to=target, word="booking.receipt"):
         return
-    await _say(city, target, f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}")
+    extra = _fac_receipt_extra(chat, city.agent_id, slot, target) if slot else ""
+    await _say(city, target, f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}{extra}")
 
 
 def _cancel_reason(chat: list[Message]) -> str:
-    """Motivo dell'annullamento visto dalla struttura: ricetta scaduta o generico (ultimo rifiuto)."""
+    """Motivo (MACH-1.1) dell'ultimo rifiuto del Ledger, con ledger_code quando serve."""
     refusals = [row for row in chat if row.sender == LEDGER and first_word(row.text) == "refused"]
-    if refusals and "PRESCRIPTION_EXPIRED" in refusals[-1].text:
+    if not refusals:
+        return "facility_cancelled"
+    text = refusals[-1].text
+    if "PRESCRIPTION_EXPIRED" in text:
         return "prescription_expired"
-    return "facility_cancelled"
+    if "CONSENT_MISSING" in text:
+        return "consent_missing"
+    fields = fields_of(text)
+    code = fields.get("code") or fields.get("reason") or ""
+    if code in {"HELD", "ALREADY_HELD", "TAKEN", "SLOT_TAKEN", "CONFLICT"}:
+        return f"slot_taken ledger_code={code}"
+    return f"hold_refused ledger_code={code}" if code else "hold_refused"
+
+
+def _fac_is_partner_confirm(message: Message, agent: str) -> bool:
+    return (
+        message.sender.startswith("agent:")
+        and message.sender != agent
+        and message.sender not in _OUR_AGENTS
+    )
+
+
+def _fac_confirm_problem(
+    chat: list[Message], agent: str, message: Message, slot: str, consent: str
+) -> str:
+    """MACH-1.1: senza consenso niente hold; confirm su un'offerta mai mandata a quel partner."""
+    if not consent:
+        return "consent_missing"
+    offered = [
+        fields_of(line)
+        for row in chat
+        if row.sender == agent and row.recipient == message.sender
+        for line in row.text.splitlines()
+        if first_word(line) == "offer"
+    ]
+    if offered and slot not in {info.get("slot_id") for info in offered}:
+        return "not_offered"
+    return ""
+
+
+def _fac_receipt_extra(chat: list[Message], agent: str, slot: str, target: str) -> str:
+    """Campi MACH-1.1 della ricevuta verso un centro prenotazioni partner."""
+    if not target.startswith("agent:") or target in _OUR_AGENTS:
+        return ""
+    info: dict[str, str] = {}
+    for row in chat:
+        for line in row.text.splitlines():
+            fields = fields_of(line)
+            if fields.get("slot_id") != slot:
+                continue
+            if row.sender == agent and first_word(line) == "offer":
+                info.update({k: v for k, v in fields.items() if k in {"offer_id", "doctor_id", "agenda_date", "request_id"}})
+            if row.sender == target and first_word(line) == "confirm":
+                info.update({k: v for k, v in fields.items() if k in {"offer_id", "request_id"}})
+    parts = [f"offer_id={info['offer_id']}"] if info.get("offer_id") else []
+    parts.append(f"slot_id={slot}")
+    for key in ("request_id", "doctor_id", "agenda_date"):
+        if info.get(key):
+            parts.append(f"{key}={info[key]}")
+    parts.append(f"facility={agent}")
+    return " " + " ".join(parts)
 
 
 async def _on_refused(
@@ -1657,7 +1734,12 @@ async def _on_refused(
         and offer_id
         and not _we(chat, agent, f"offer_id={offer_id}", to=target, word="cancel")
     ):
-        await _say(city, target, f"cancel offer_id={offer_id} reason={_cancel_reason(chat)}")
+        tag = ""
+        if target.startswith("agent:") and target not in _OUR_AGENTS:
+            rid = _fac_receipt_extra(chat, agent, slot, target)
+            rid_fields = fields_of(rid)
+            tag = f" request_id={rid_fields['request_id']}" if rid_fields.get("request_id") else ""
+        await _say(city, target, f"cancel offer_id={offer_id} reason={_cancel_reason(chat)}{tag}")
     if hold_self:
         await _advance(city, message, chat, fixed="CONS-GIN", replacing=True)
 
