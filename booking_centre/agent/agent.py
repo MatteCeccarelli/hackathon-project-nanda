@@ -683,6 +683,146 @@ def _gender(chat: list[Message]) -> str | None:
     return None
 
 
+# --- comodità: giorni, orario e distretto del cittadino ------------------------------------
+# Prima si tengono solo gli slot validi (fitting / controlli del partner), poi si ordinano per
+# le preferenze dette dal cittadino. I giorni sono una preferenza (S_pref): mettono prima gli
+# slot giusti ma non escludono gli altri. Un orario detto come vincolo («posso solo dopo le
+# 16») esclude gli slot fuori fascia; detto come preferenza («meglio il pomeriggio») li ordina.
+
+_DAY_NAMES: dict[str, tuple[str, ...]] = {
+    "mon": ("lunedì", "lunedi", "monday"),
+    "tue": ("martedì", "martedi", "tuesday"),
+    "wed": ("mercoledì", "mercoledi", "wednesday"),
+    "thu": ("giovedì", "giovedi", "thursday"),
+    "fri": ("venerdì", "venerdi", "friday"),
+    "sat": ("sabato", "saturday"),
+    "sun": ("domenica", "sunday"),
+}
+_NEGATION = r"(?:non|not|no|tranne|except|escluso|esclusi)\W+(?:\w+\W+){0,3}"
+_HARD_WORDS = re.compile(
+    r"\b(?:solo|soltanto|unicamente|esclusivamente|only|non posso|cannot|can't|can not)\b"
+)
+
+
+def _citizen_texts(chat: list[Message]) -> list[str]:
+    return [row.text for row in chat if row.sender.startswith("citizen:")]
+
+
+def _days_pref(chat: list[Message]) -> set[str]:
+    """Giorni preferiti: token ``days=mon/wed`` oppure nomi dei giorni nel testo del cittadino."""
+    for text in _citizen_texts(chat):
+        raw = fields_of(text).get("days", "")
+        if raw:
+            got = {part.strip().lower()[:3] for part in re.split(r"[/,;|]", raw) if part.strip()}
+            got &= set(_DAY_NAMES)
+            if got:
+                return got
+    found: set[str] = set()
+    for text in _citizen_texts(chat):
+        low = text.lower()
+        for code, names in _DAY_NAMES.items():
+            for name in names:
+                if re.search(rf"\b{name}\b", low) and not re.search(rf"\b{_NEGATION}{name}\b", low):
+                    found.add(code)
+    return found
+
+
+def _hour(raw: str, minutes: str | None, pm: str | None) -> int:
+    hour = int(raw)
+    if pm and hour < 12:
+        hour += 12
+    elif hour < 8:
+        # «dopo le 4» in un contesto di visite vuol dire le 16.
+        hour += 12
+    return min(hour, 24) * 60 + (int(minutes) if minutes else 0)
+
+
+def _time_pref(chat: list[Message]) -> tuple[int, int, bool] | None:
+    """Fascia oraria detta dal cittadino: (da_minuto, a_minuto, vincolante)."""
+    hhmm = r"(?:ore\s*)?(\d{1,2})(?:[:.](\d{2}))?\s*(pm|p\.m\.)?"
+    for text in reversed(_citizen_texts(chat)):
+        low = text.lower()
+        patterns = (
+            (rf"\b(?:dopo\s+le|dalle|after)\s+{hhmm}", "from"),
+            (rf"\b(?:prima\s+delle|entro\s+le|before)\s+{hhmm}", "to"),
+            (r"\b(?:pomeriggio|afternoon|evening|sera)\b", "pm"),
+            (r"\b(?:mattina|mattino|mattinata|morning)\b", "am"),
+        )
+        for pattern, kind in patterns:
+            match = re.search(pattern, low)
+            if match is None:
+                continue
+            before = low[max(0, match.start() - 30): match.start()]
+            if re.search(rf"\b{_NEGATION}$", before + " "):
+                continue
+            hard = _HARD_WORDS.search(before) is not None
+            if kind == "from":
+                return (_hour(match.group(1), match.group(2), match.group(3)), 24 * 60, hard)
+            if kind == "to":
+                return (0, _hour(match.group(1), match.group(2), match.group(3)), hard)
+            if kind == "pm":
+                return (13 * 60, 24 * 60, hard)
+            return (0, 13 * 60, hard)
+    return None
+
+
+def _district(chat: list[Message]) -> str:
+    for text in _citizen_texts(chat):
+        fields = fields_of(text)
+        value = fields.get("area.district") or fields.get("district") or ""
+        if value:
+            return value
+    return ""
+
+
+def _slot_time(slot: dict[str, str]) -> datetime | None:
+    return _when(slot.get("at") or slot.get("agenda_date") or "")
+
+
+def _comfort_miss(
+    slot: dict[str, str], days: set[str], window: tuple[int, int, bool] | None
+) -> tuple[int, int]:
+    """(fuori fascia oraria, fuori giorni preferiti): 0 = rispettato."""
+    at = _slot_time(slot)
+    day = (slot.get("day") or slot.get("agenda_day") or "").lower()
+    if not day and at is not None:
+        day = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[at.weekday()]
+    day_miss = 1 if days and day and day not in days else 0
+    time_miss = 0
+    if window is not None and at is not None:
+        minute = at.hour * 60 + at.minute
+        time_miss = 0 if window[0] <= minute < window[1] else 1
+    return (time_miss, day_miss)
+
+
+def _bc_by_comfort(slots: list[dict[str, str]], chat: list[Message]) -> list[dict[str, str]]:
+    """Slot validi già in ordine di data -> esclude i fuori fascia vincolanti, poi ordina."""
+    days = _days_pref(chat)
+    window = _time_pref(chat)
+    if not days and window is None:
+        return slots
+    if window is not None and window[2]:
+        slots = [slot for slot in slots if _comfort_miss(slot, set(), window)[0] == 0]
+    return sorted(slots, key=lambda slot: _comfort_miss(slot, days, window))
+
+
+def _bc_comfort_note(english: bool, slots: list[dict[str, str]], chat: list[Message]) -> str:
+    """Frase che spiega l'ordine (niente parole-atto, niente dati clinici)."""
+    days = _days_pref(chat)
+    window = _time_pref(chat)
+    if not slots or (not days and window is None):
+        return ""
+    what_it = " e ".join(x for x in ("nei giorni" if days else "", "nella fascia oraria" if window else "") if x)
+    what_en = " and ".join(x for x in ("on the days" if days else "", "at the times" if window else "") if x)
+    if _comfort_miss(slots[0], days, window) == (0, 0):
+        if english:
+            return f"I put first the option {what_en} you mentioned."
+        return f"Ho messo per prima l'opzione {what_it} che ha indicato."
+    if english:
+        return f"I found nothing {what_en} you mentioned, so these are the earliest times available."
+    return f"Non ho trovato posti {what_it} che ha indicato: queste sono le prime date disponibili."
+
+
 def _offer_line(slot: dict[str, str], number: str | None, priority: str | None) -> str:
     parts = [
         "offer",
@@ -1029,6 +1169,7 @@ async def _advance_alone(
             )
             if slot.get("slot_id") not in taken and slot.get("doctor_id") not in rejected_doctors
         ]
+        chosen = _bc_by_comfort(chosen, chat)
         if not retry or chosen or retry_page >= min(_page(world)[1], _MAX_PAGE):
             break
         retry_page += 1
@@ -1037,6 +1178,9 @@ async def _advance_alone(
         slots_to_offer = chosen[:3]
         act_lines = [_offer_line(s, number, priority) for s in slots_to_offer]
         courtesy = _bc_offers_courtesy(lang != "it", procedure, slots_to_offer)
+        note = _bc_comfort_note(lang != "it", slots_to_offer, chat)
+        if note:
+            courtesy = f"{courtesy} {note}".strip()
         full_text = "\n".join(act_lines) + (f"\n{courtesy}" if courtesy else "")
         if await _say(city, citizen, full_text):
             if retry:
@@ -1276,12 +1420,22 @@ async def _bc_discover(
     gender = _gender(chat)
     if gender:
         criteria += f" gender_preference={gender}"
+    days = _days_pref(chat)
+    if days:
+        criteria += " days=" + "/".join(d for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun") if d in days)
+    district = _district(chat)
 
     request_id = f"{key}.{retry_offer}" if retry_offer else key
     contacted = 0
     # MACH-1.1: con una lingua rara si scrive PRIMA all'ASST che la parla, poi ai partner che
     # hanno pubblicato i loro id (fidati), infine agli altri trovati sull'Index.
-    peers = sorted(peers, key=lambda peer: _bc_peer_rank(getattr(peer, "agent_id", ""), lang))
+    peers = sorted(
+        peers,
+        key=lambda peer: (
+            _bc_peer_rank(getattr(peer, "agent_id", ""), lang),
+            0 if district and str(getattr(peer, "district", "")) == district else 1,
+        ),
+    )
     for peer in peers:
         peer_id = getattr(peer, "agent_id", "")
         if not _bc_is_partner(city, peer_id):
@@ -1305,7 +1459,7 @@ async def _bc_discover(
             contacted += 1
         # Con una lingua diversa dall'italiano il medico giusto sta in una sola ASST (es. urdu ->
         # Nord): si chiede a tutti i partner trovati, altrimenti si resta a 12.
-        if contacted >= (_BC_MAX_PARTNERS_LANG if criteria else 12):
+        if contacted >= (_BC_MAX_PARTNERS_LANG if (lang and lang != "it") or gender else 12):
             break
 
     # Il cittadino non resta senza risposta mentre aspettiamo i partner.
@@ -1796,7 +1950,16 @@ async def _bc_external_offer(city: City, message: Message, chat: list[Message]) 
         line = _bc_partner_offer_line(city, message, chat, info)
         if line is not None:
             lines.append(line)
-    lines.sort(key=lambda item: item[0])
+    days = _days_pref(chat)
+    window = _time_pref(chat)
+
+    def comfort(item: tuple[datetime, str, str]) -> tuple[int, int]:
+        offer = fields_of(item[2].splitlines()[0])
+        return _comfort_miss(offer, days, window)
+
+    if window is not None and window[2]:
+        lines = [item for item in lines if comfort(item)[0] == 0]
+    lines.sort(key=lambda item: (comfort(item), item[0]))
     for _, slot_id, text in lines[: max(room, 0)]:
         if await _say(city, citizen, text):
             sent.offers.add(slot_id)
