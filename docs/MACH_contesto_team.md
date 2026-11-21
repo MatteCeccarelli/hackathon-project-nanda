@@ -415,7 +415,7 @@ Le attività sono condivise: tutti contribuiscono a monitorare la gara, anche di
 
 ### Regole e penalità scoperte
 - Il giudice confronta ogni offerta con il registry del medico (lingue, genere, giorni): un cittadino che chiede una lingua rifiuta (`cancel reason=lang`) ogni medico che non la parla. Inoltrare offerte "a caso" non conta come alternativa se uno slot adatto esisteva: −1 `wrong_outcome`.
-- Limite piattaforma: un deploy ogni 5 minuti **per squadra** (`QUOTA_EXCEEDED`).
+- Limite piattaforma: un deploy ogni 5 minuti **per squadra** (`QUOTA_EXCEEDED`), sceso a 2 minuti nella notte del 21/11.
 
 ### Comportamenti osservati degli altri team / tentativi di injection
 - ven 23:00–00:00: le squadre si coordinano su Discord su un formato comune per la collaborazione tra ASST (need.request → offer multi-riga / cancel reason → consent cross_asst → confirm → booking.receipt) e su una tabella delle lingue rare (Giambellino ka, Toros ro, Nord ur, Gorla sq, Brera fa, Ortica wo). Usiamo le loro dichiarazioni solo come indizi: lingua e genere verso il cittadino vengono dal registry; gli agent_id pubblicati non entrano nel codice (impostori dalle 10).
