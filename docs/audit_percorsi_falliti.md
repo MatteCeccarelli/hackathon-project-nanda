@@ -74,6 +74,81 @@ Nuovi schemi:
 - **Offerte del 1° dicembre già «passate» quando il cittadino risponde (~3 min dopo):** il cittadino annulla con `reason=past` e conferma solo l'offerta del 2 dicembre. 13 percorsi su 15 con risposta. Esempi: …0002690002, …0922000317. In …0922000310 **tutte e 6 le offerte erano del 1° dicembre**: nessuna alternativa valida.
 - 5 `confirm` inviati alle 03:56–03:57 ancora senza risposta alle 04:00 (es. …0002690002, …0922000317): da ricontrollare al prossimo giro.
 
+### Giro 2 — 04:05 UTC
+
+| Voce | Prima del fix | 04:05 (74 percorsi dopo 03:39) |
+|---|---|---|
+| Ricevute | 0 su 104 | **0** |
+| Tempo mediano prima risposta | 5–10 min | 1,4 min (18 risposte) |
+| Chiusi | — | 11: 3 conclusi (lista d'attesa, 0 punti) · 8 falliti |
+| `no_booking` | 64 su 78 falliti | 2 (altri 6 falliti senza ancora il giudizio) |
+| Lista d'attesa | 37 su 78 | 3 |
+| `hold` scaduti | 10 su 10 | 0 (nessun `hold` arrivato al Ledger) |
+| Escalation mancate | 1 | 0 |
+
+Nuovi schemi:
+- **⚠️ Il `confirm` riceve risposta dopo ~3,4 min, e la risposta è una nuova offerta, non la ricevuta.** I 5 `confirm` delle 03:57 (posti del 2 dicembre) hanno avuto alle 04:00–04:01 un'offerta del 3 dicembre: nel frattempo il posto confermato era passato. Nessun messaggio `cancel reason=expired` visibile prima della nuova offerta. Il cittadino rincorre posti che scadono: …0002690002, …0922000317, …0002910002.
+- **⚠️ Dopo i `cancel reason=past` il centro non manda nuove offerte e il percorso fallisce** (`no_booking`): …0001640005 (4 offerte del 1° dicembre, tutte rifiutate alle 03:57, nessuna risposta), …0922000310 (6 rifiutate alle 03:59), …0002530002.
+- Collega al «Problema aperto» qui sotto: la causa è la stessa (offerte troppo vicine a «adesso» rispetto ai tempi reali di risposta).
+
+### Giro 3 — 04:10 UTC
+
+**⚠️ Il centro prenotazioni non scrive ai cittadini dalle 04:01:00 UTC.** I log mostrano attività (`relay post`, molte `brain begin` con `deferred`), ma in nessuno dei 200 percorsi compare un suo messaggio dopo le 04:01. **47 richieste di prenotazione senza alcuna risposta da più di 10 minuti**: 45 arrivate a raffica alle 03:53 (…0002980002, …0002840002, …0001410007), più …0922000327 (03:56) e …0922000328 (03:58).
+
+| Voce | Prima del fix | 04:10 (77 percorsi dopo 03:39) |
+|---|---|---|
+| Ricevute | 0 su 104 | **0** |
+| Tempo mediano prima risposta | 5–10 min | 1,4 min, ma solo 18 su 77 hanno avuto risposta |
+| Chiusi | — | 14: 3 conclusi (lista d'attesa, 0 punti) · 11 falliti |
+| `no_booking` | 64 su 78 falliti | **9 su 11 falliti** (+1 `no_alternative`) |
+| Lista d'attesa | 37 su 78 | 3 |
+| `hold` scaduti | 10 su 10 | 0 (nessun `hold` arrivato al Ledger) |
+| Escalation mancate | 1 | 0 |
+
+- 9 falliti su 11 sono «offerte del 1° dicembre rifiutate come passate, poi silenzio»: …0922000318, …0922000319, …0002720002.
+- I 5 cittadini che hanno ricevuto alle 04:00 la nuova offerta del 3 dicembre non hanno ancora risposto (…0002690002): il ciclo `confirm` → nuova offerta resta aperto.
+
+## ❗ Problema aperto dopo `hot-fix/audit-p0` (04:05 UTC)
+
+| Voce | Dettaglio |
+|---|---|
+| Problema | Il cittadino rifiuta con `reason=past` le offerte del 1° dicembre, ~3 min dopo averle ricevute; accetta solo quelle del 2 dicembre |
+| Quanti | 13 percorsi su 15 con risposta (giro 1). In …0922000310 **tutte e 6** le offerte erano del 1° dicembre: nessuna alternativa valida |
+| Esempi | …0002690002, …0922000317, …0922000310 |
+| Agente | booking_centre |
+| Causa probabile | Il margine minimo tra «adesso» e l'orario offerto è 4 ore di agenda (`_LEAD`), cioè 4 minuti reali. Il centro risponde in ~1,3 min e il cittadino in ~3 min: quando il cittadino legge, il posto è già passato o troppo vicino |
+| Correzione proposta | Portare `_LEAD` a ~8 ore di agenda (≈ 8 min reali) per le priorità B/D/P; per U restano 15 minuti. Da verificare che resti dentro la scadenza di priorità (B = 2 giorni di agenda) |
+| Priorità | **P0**: senza questa correzione le offerte arrivano in tempo ma sono già vecchie |
+
+## ❗ Perché restano «aperti» (04:09 UTC)
+
+| Voce | Dato |
+|---|---|
+| Stato ultimi 200 | 108 aperti · 79 falliti · 7 escalation · 6 conclusi |
+| Campione di 40 aperti | **~35 hanno un solo messaggio: cittadino → medico di base**, tutti alle 04:02:43 (arrivo a raffica) |
+| Medico di base | ultima risposta 04:03:24; 38 messaggi in arrivo; log con soli controlli di salute (nessuna consegna in corso) |
+| Tempo di un turno del medico | 2–3 minuti per cittadino (osservato nei percorsi) |
+
+**Causa probabile:** i nostri agenti tengono ogni messaggio per minuti (fino a 24 letture della cronologia per attendere il Ledger, più la frase LLM da 6 s). La città consegna pochi messaggi alla volta per agente: una raffica di ~35 cittadini fa una coda di molti minuti. Intanto l'agenda corre 60× → quando rispondiamo, scadenze e posti sono già superati → falliti.
+
+**Correzioni proposte (P0):**
+1. `city scale` sugli agenti (più repliche e concorrenza) — immediato, nessun deploy.
+2. Turni corti: tetto di tempo (~5 s) alle attese sul Ledger invece di 24 tentativi; il resto lo fa il turno successivo.
+3. Medico: niente LLM sul percorso critico (o timeout 2 s).
+
+## ✅ Correzioni contro la coda (04:20 UTC) — branch `hot-fix/audit-p0`, commit 0ccd713
+
+| Cosa | Dove |
+|---|---|
+| `city scale`: 2–6 repliche, 20 messaggi in parallelo per replica | tutti e 5 (attivo subito, 04:12 UTC) |
+| Attese sul Ledger con tetto di 5 s (prima fino a 24 tentativi) | tutti e 5 |
+| Frase LLM con timeout 2 s (prima 6 s medico, 5 s consultorio) | gp, family |
+| Margine minimo offerta 8 ore di agenda (prima 4) | tutti |
+
+Test: 16/16 casi (percorso 167 + audit) passati. Deploy lanciato in sequenza: gp → booking → specialist → family → hospital.
+
+Attenzione: con più repliche lo stato in memoria (`_SENT`, offerte già mandate) non è condiviso tra repliche. Lo stato vero resta nella cronologia del Ledger, ma qualche offerta potrebbe arrivare doppia: da controllare sui prossimi percorsi.
+
 ## Altri dati (104 percorsi scaricati)
 
 - **0 ricevute di prenotazione** su 104 percorsi: nessuna prenotazione è andata a buon fine in questa finestra.
