@@ -1,7 +1,7 @@
 agent_id: agent:d0kkschyjrdq
 team: team:t-5-gin-tokens
 name: family_counseling
-version: 1.0.8
+version: 1.0.9
 cap_versions:
   - "1.0"
 profiles:
