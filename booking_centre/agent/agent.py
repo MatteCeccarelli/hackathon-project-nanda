@@ -58,7 +58,7 @@ _LOG = logging.getLogger("care")
 # The Relay accepts a ledger reply and then the agent rejects the push, so the reply sits in
 # the case history and never opens a turn. Wait briefly and read it back from history.
 _PULL_TRIES = 24
-_PULL_PAUSE = 0.25
+_PULL_PAUSE = 1.0  # audit 3: con 0.25 s ogni attesa faceva fino a 20 letture al Relay
 # Tetto di tempo reale per ogni attesa sul Ledger: turni corti, la citta' consegna pochi
 # messaggi alla volta per agente e una raffica di cittadini fa coda (audit 04:09 UTC).
 _PULL_BUDGET_S = 5.0
@@ -1319,6 +1319,13 @@ async def _advance_alone(
         return
     if now is not None and message.sender != LEDGER:
         chat, now, world = await _bc_fresh_clock(city, message, chat, procedure, now, world, retry)
+    elif now is not None:
+        # Audit 3: nei turni del Ledger l'agenda non si rilegge (ciclo), ma la riga letta puo'
+        # essere vecchia di molti minuti reali = ore di agenda: si stima l'ora attuale (x60),
+        # altrimenti si offrono posti gia' passati (cancel reason=past).
+        agenda_row = _latest_ledger_row(chat, "agenda")
+        if agenda_row is not None:
+            now = now + timedelta(seconds=_age_seconds(agenda_row) * 60)
     if now is None or (world is None and not retry):
         return
     if fixed is None and _rx_expired(chat, _rx_reply(chat), now):
