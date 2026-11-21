@@ -57,11 +57,11 @@ _RX = re.compile(r"^prescription_number-[A-Z0-9-]{4,40}$")
 _LOG = logging.getLogger("care")
 # The Relay accepts a ledger reply and then the agent rejects the push, so the reply sits in
 # the case history and never opens a turn. Wait briefly and read it back from history.
-_PULL_TRIES = 24
-_PULL_PAUSE = 1.0  # audit 3: con 0.25 s ogni attesa faceva fino a 20 letture al Relay
+_PULL_TRIES = 40
+_PULL_PAUSE = 1.0  # audit 4: una lettura al secondo
 # Tetto di tempo reale per ogni attesa sul Ledger: turni corti, la citta' consegna pochi
 # messaggi alla volta per agente e una raffica di cittadini fa coda (audit 04:09 UTC).
-_PULL_BUDGET_S = 5.0
+_PULL_BUDGET_S = 30.0  # audit 4: una risposta del Ledger persa nel turno costa un'altra consegna (4-30 min di Relay)
 # Needs whose sent offers this process remembers; the oldest is forgotten first.
 _SENT_NEEDS = 4096
 
