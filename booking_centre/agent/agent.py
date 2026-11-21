@@ -1661,6 +1661,13 @@ async def _bc_discover(
     if days:
         criteria += " days=" + "/".join(d for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun") if d in days)
     district = _district(chat)
+    # MACH-1.2 + scuola-di-atene: primo momento utile = adesso + 8 h di agenda (U: 15 min),
+    # cosi' i partner non propongono posti che arriverebbero al cittadino gia' passati.
+    agenda = _ledger(chat, "agenda")
+    now = _when("" if agenda is None else agenda.get("agenda_now", ""))
+    if now is not None:
+        lead = timedelta(minutes=15) if priority == "U" else _LEAD
+        criteria += f" after={(now + lead).isoformat()}"
 
     request_id = f"{key}.{retry_offer}" if retry_offer else key
     contacted = 0
