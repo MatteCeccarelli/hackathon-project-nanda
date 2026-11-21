@@ -312,16 +312,32 @@ async def _await_line(
         except CapError:
             fresh = chat
         hit = _latest(fresh, head, token)
-        if hit is not None:
-            return hit, fresh
+        refusal = None
         for row in fresh:
             if row.msg_id in known or row.sender != LEDGER:
                 continue
-            if first_word(row.text) == "refused" and op in words(row.text):
-                return row, fresh
+            if first_word(row.text) == "refused" and _refuses(row.text, op):
+                refusal = row
+        if refusal is not None and (hit is None or fresh.index(refusal) > fresh.index(hit)):
+            _LOG.info("care.ledger.refused", extra={"op": op, "code": _ledger_code(refusal.text)})
+            return refusal, fresh
+        # Una riga gia' letta prima di questo tentativo puo' essere di un tentativo vecchio:
+        # si preferisce la risposta nuova e si usa la vecchia solo a fine attesa.
+        if hit is not None and (hit.msg_id not in known or attempt + 1 >= _PULL_TRIES):
+            return hit, fresh
         if attempt + 1 < _PULL_TRIES:
             await asyncio.sleep(_PULL_PAUSE)
     return None
+
+
+def _refuses(text: str, op: str) -> bool:
+    """Rifiuto del Ledger per ``op``: parola dell'operazione o token ``op=<op>``."""
+    return op in words(text) or f"op={op}" in text.split()
+
+
+def _ledger_code(text: str) -> str:
+    fields = fields_of(text)
+    return (fields.get("code") or fields.get("reason") or "")[:40]
 
 
 def _has_agenda(chat: list[Message]) -> bool:
@@ -765,6 +781,21 @@ async def _desk(
         return
     if message.sender == LEDGER or message.sender.startswith("citizen:"):
         await _advance(city, message, chat, fixed=fixed, replacing=False)
+
+
+def _awaiting_replacement(chat: list[Message], agent: str) -> bool:
+    """L'ultimo nostro messaggio al cittadino è un cancel, senza offerte dopo."""
+    citizen = _citizen(chat)
+    if not citizen:
+        return False
+    for row in reversed(chat):
+        if row.sender == agent and row.recipient == citizen:
+            head = first_word(row.text)
+            if head == "offer" or head == "booking.receipt":
+                return False
+            if head == "cancel":
+                return True
+    return False
 
 
 async def _advance(
@@ -1565,7 +1596,7 @@ def _facility_turn(message: Message) -> bool:
     kind = words(message.text)
     if message.sender == LEDGER and head in {"held", "committed", "checked_in", "reported"}:
         return True
-    if message.sender == LEDGER and head == "refused" and "hold" in kind:
+    if message.sender == LEDGER and head == "refused" and _refuses(message.text, "hold"):
         return True
     if "checkin" in kind and message.sender.startswith("citizen:"):
         return True
@@ -1595,7 +1626,7 @@ async def _facility(
         await _on_held(city, message, chat)
     elif message.sender == LEDGER and head == "committed":
         await _on_committed(city, message, chat)
-    elif message.sender == LEDGER and head == "refused" and "hold" in kind:
+    elif message.sender == LEDGER and head == "refused" and _refuses(message.text, "hold"):
         await _on_refused(city, message, chat, hold_self=hold_self)
     elif message.sender == LEDGER and head == "checked_in":
         await _on_checked_in(city, message, chat, reports=reports)
