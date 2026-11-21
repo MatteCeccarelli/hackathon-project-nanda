@@ -1030,7 +1030,7 @@ async def _desk(
         # alternative (percorsi 1670002 / 1670003).
         if message.sender == LEDGER and fixed is None and _awaiting_replacement(chat, city.agent_id):
             trigger = _replacement_trigger(chat, city.agent_id)
-            if trigger is not None and _bc_once(f"{message.need_id}:{trigger.msg_id}"):
+            if trigger is not None:
                 await _advance(city, trigger, chat, fixed=fixed, replacing=True)
                 return
         await _advance(city, message, chat, fixed=fixed, replacing=is_cancel)
