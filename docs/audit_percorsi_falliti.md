@@ -35,6 +35,45 @@ Test: 9/9 casi dell'audit con Ledger simulato; 7/7 scenari del percorso 167; nes
 
 Non coperti (P1/P2): tabella dei protocolli dal Ledger (gp), consenso cross-ASST con `data.request`, sintomo diverso tra medico e centro (da segnalare agli organizzatori).
 
+## Aggiornamenti live dopo il hot-fix
+
+Metodo: ultimi 200 percorsi della console, tutti scaricati in dettaglio. «Prima risposta» = minuti tra il primo messaggio del cittadino al centro prenotazioni e la prima risposta del centro.
+
+### Giro 0 — 03:52 UTC (punto di partenza, prima del deploy)
+
+**⚠️ Dopo il rollback (03:39) il centro prenotazioni non ha ancora risposto a nessun cittadino.** 10 cittadini gli hanno scritto tra 03:39 e 03:50: 0 risposte (il più vecchio aspetta da 11 min: …0922000310, …0922000319, …0922000321). Nei 200 percorsi l'ultimo messaggio del centro a un cittadino è delle **02:46:06 UTC**: il «relay post» delle 03:39:57 visto nei log non compare in nessun percorso.
+
+**⚠️ Log non leggibili:** `/v1/logs` risponde `503 DRAINING` per centro prenotazioni e medico (03:51 UTC). Problema della piattaforma, non nostro. Alle 03:54 i log tornano leggibili: il centro è vivo ma le 150 righe coprono solo 12 secondi, quasi tutte `relay history` (~5 letture al secondo della casella) e nessun `relay post`. Sembra impegnato a rileggere l'arretrato, senza rispondere.
+
+| Voce | Primo messaggio al centro prima delle 03:39 (111) | Dopo le 03:39 (10) |
+|---|---|---|
+| Ricevute di prenotazione | 0 | 0 |
+| Risposte del centro | 22 su 111 | 0 su 10 |
+| Tempo mediano prima risposta | 9,1 min | — |
+| `no_booking` (−1) | 61 | — (ancora aperti) |
+| `no_alternative` (−1) | 30 | — |
+| Lista d'attesa proposta | 20 | 0 |
+| `hold` scaduti | 0 nei fatti del giudice (3 nei percorsi senza centro) | 0 |
+| Escalation mancate (`red_flag` −2) | 1 | 0 |
+
+### Giro 1 — 04:00 UTC
+
+**Il centro prenotazioni risponde di nuovo.** Dalle 03:53 offre posti in **~1 min 20 s** (mediana su 15 risposte), contro 9 min prima. Nei log `relay post` regolari (03:56, 03:59). `/v1/logs` va ancora a tratti in `503 DRAINING`.
+
+| Voce | Prima del fix | 04:00 (73 percorsi scritti al centro dopo 03:39) |
+|---|---|---|
+| Ricevute | 0 su 104 | **0** (nessun percorso ancora chiuso con conferma) |
+| Tempo mediano prima risposta | 5–10 min | **1,3 min** |
+| `no_booking` | 64 su 78 falliti | 0 (71 ancora aperti) |
+| Lista d'attesa | 37 su 78 | 2 (risposte delle 03:53, prima del deploy) |
+| `hold` scaduti | 10 su 10 | 0 |
+| Escalation mancate | 1 | 0 |
+
+Nuovi schemi:
+- **La lista d'attesa chiude il percorso come «concluso» con 0 punti** (`relaxed_alternative 0`), non come fallito: …0922000312, …0922000321.
+- **Offerte del 1° dicembre già «passate» quando il cittadino risponde (~3 min dopo):** il cittadino annulla con `reason=past` e conferma solo l'offerta del 2 dicembre. 13 percorsi su 15 con risposta. Esempi: …0002690002, …0922000317. In …0922000310 **tutte e 6 le offerte erano del 1° dicembre**: nessuna alternativa valida.
+- 5 `confirm` inviati alle 03:56–03:57 ancora senza risposta alle 04:00 (es. …0002690002, …0922000317): da ricontrollare al prossimo giro.
+
 ## Altri dati (104 percorsi scaricati)
 
 - **0 ricevute di prenotazione** su 104 percorsi: nessuna prenotazione è andata a buon fine in questa finestra.
