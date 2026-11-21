@@ -1019,6 +1019,10 @@ async def _desk(
     if "cancel" in kind and message.sender.startswith("agent:"):
         await _partner_cancel(city, message, chat, fixed=fixed)
         return
+    if message.sender == LEDGER and _bc_ledger_idle(chat, city.agent_id):
+        # Audit 2: ogni risposta del Ledger apriva un turno che richiedeva l'agenda, all'infinito,
+        # anche sui percorsi gia' chiusi, e la coda rallentava i cittadini in attesa.
+        return
     if message.sender == LEDGER or message.sender.startswith("citizen:"):
         is_cancel = message.sender.startswith("citizen:") and "cancel" in kind
         # Il catalogo chiesto dopo un cancel puo' arrivare in un turno a parte: senza questo
@@ -1026,7 +1030,7 @@ async def _desk(
         # alternative (percorsi 1670002 / 1670003).
         if message.sender == LEDGER and fixed is None and _awaiting_replacement(chat, city.agent_id):
             trigger = _replacement_trigger(chat, city.agent_id)
-            if trigger is not None:
+            if trigger is not None and _bc_once(f"{message.need_id}:{trigger.msg_id}"):
                 await _advance(city, trigger, chat, fixed=fixed, replacing=True)
                 return
         await _advance(city, message, chat, fixed=fixed, replacing=is_cancel)
@@ -1074,6 +1078,41 @@ def _late_page(chat: list[Message], agent: str, page: int) -> Message | None:
 
 
 _FRESH_SECONDS = 30
+_QUIET_SECONDS = 20 * 60
+_AGENDA_SPEED = 60
+_LEDGER_REPLACED: OrderedDict[str, None] = OrderedDict()
+
+
+def _bc_once(key: str) -> bool:
+    """Vero solo la prima volta che si vede key (memoria limitata)."""
+    if key in _LEDGER_REPLACED:
+        return False
+    _LEDGER_REPLACED[key] = None
+    while len(_LEDGER_REPLACED) > 4096:
+        _LEDGER_REPLACED.popitem(last=False)
+    return True
+
+
+def _bc_ledger_idle(chat: list[Message], agent: str) -> bool:
+    """Audit 2: un turno aperto da una risposta del Ledger non ha niente da fare se il cittadino
+    tace da piu' di 20 minuti, se ha gia' avuto risposta (salvo un nostro cancel senza offerte
+    nuove) o se ha appena confermato (il confirm si gestisce nel suo turno)."""
+    citizen = _citizen(chat)
+    if not citizen:
+        return False
+    last_in = last_out = -1
+    for i, row in enumerate(chat):
+        if row.sender == citizen:
+            last_in = i
+        elif row.sender == agent and row.recipient == citizen:
+            last_out = i
+    if last_in < 0:
+        return False
+    if _age_seconds(chat[last_in]) > _QUIET_SECONDS:
+        return True
+    if last_out > last_in:
+        return first_word(chat[last_out].text) != "cancel"
+    return first_word(chat[last_in].text) == "confirm"
 
 
 def _age_seconds(row: Message) -> float:
@@ -1272,7 +1311,7 @@ async def _advance_alone(
         )
     else:
         return
-    if now is not None:
+    if now is not None and message.sender != LEDGER:
         chat, now, world = await _bc_fresh_clock(city, message, chat, procedure, now, world, retry)
     if now is None or (world is None and not retry):
         return
@@ -1469,6 +1508,14 @@ async def _bc_confirm_past(city: City, message: Message, chat: list[Message]) ->
     at = _when(offer.get("agenda_date", "")) if offer else None
     if at is None or offer_id.startswith("wl-"):
         return False
+    known = _latest_ledger_row(chat, "agenda")
+    known_now = _when(fields_of(known.text).get("agenda_now", "")) if known is not None else None
+    if known_now is not None:
+        guess = known_now + timedelta(seconds=_age_seconds(known) * _AGENDA_SPEED)
+        if at > guess + timedelta(hours=1):
+            # Audit 2: posto chiaramente ancora lontano, il confirm parte subito. Il giro di
+            # agenda costava minuti sotto coda e faceva scadere il posto (cancel reason=expired).
+            return False
     seen = {row.msg_id for row in chat}
     if not await _say(city, LEDGER, "agenda"):
         return False
