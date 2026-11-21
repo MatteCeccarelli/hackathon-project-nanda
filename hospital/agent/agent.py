@@ -1753,7 +1753,12 @@ async def _facility(
         await _on_reported(city, message, chat)
     elif "checkin" in kind and message.sender.startswith("citizen:"):
         await _on_checkin(city, message, chat, reports=reports)
-    elif reports and message.sender.startswith("citizen:") and _report_pending(chat, city.agent_id):
+    elif (
+        reports and message.sender.startswith("citizen:") and _report_pending(chat, city.agent_id)
+        and _report_ask_age(chat, city.agent_id) > _REPORT_WAIT_S + 10
+    ):
+        # Riserva: il turno del check-in archivia gia' il referto entro _REPORT_WAIT_S; questo
+        # ramo serve solo se quel turno si e' interrotto prima.
         # Risposta alla richiesta di consenso al referto: con consent_ref si condivide, un no
         # in parole semplici (nessun consent_ref) archivia il referto senza condividerlo.
         await _finish_report(city, message, chat, fields_of(message.text).get("consent_ref", ""))
@@ -2045,7 +2050,48 @@ async def _on_checked_in(
     # Kit E19: dopo il check-in lo specialista chiede il consenso con scopo report_sharing e
     # archivia il referto con il consent_ref restituito (turno della risposta del cittadino).
     if not any(row.sender == city.agent_id and "purpose=report_sharing" in row.text.split() for row in chat):
-        await _say(city, citizen, _REPORT_ASK)
+        if not await _say(city, citizen, _REPORT_ASK):
+            await _finish_report(city, message, chat, "", booking_id=booking_id)
+            return
+    # Rubrica: «referto archiviato e follow-up per protocollo» +2, «referto mancante» -1. Si
+    # aspetta la risposta per poco: con consent_ref si condivide, con un no o senza risposta
+    # si archivia senza condividere (kit E19). Il referto parte sempre da questo turno.
+    reply, chat = await _await_report_consent(city, message.need_id, chat, citizen)
+    consent_ref = fields_of(reply.text).get("consent_ref", "") if reply is not None else ""
+    await _finish_report(city, message, chat, consent_ref, booking_id=booking_id)
+
+
+_REPORT_WAIT_S = 20.0
+
+
+async def _await_report_consent(
+    city: City, need_id: str | None, chat: list[Message], citizen: str
+) -> tuple[Message | None, list[Message]]:
+    """Prima risposta del cittadino dopo la richiesta di consenso, entro _REPORT_WAIT_S."""
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    fresh = chat
+    while True:
+        asked = max((i for i, row in enumerate(fresh) if row.sender == city.agent_id
+                     and "purpose=report_sharing" in row.text.split()), default=-1)
+        if asked >= 0:
+            for row in fresh[asked + 1:]:
+                if row.sender == citizen:
+                    return row, fresh
+        if loop.time() - started >= _REPORT_WAIT_S:
+            return None, fresh
+        await asyncio.sleep(1.0)
+        try:
+            fresh = await city.history(need_id=need_id)
+        except CapError:
+            pass
+
+
+def _report_ask_age(chat: list[Message], agent: str) -> float:
+    for row in reversed(chat):
+        if row.sender == agent and "purpose=report_sharing" in row.text.split():
+            return _age_seconds(row)
+    return 0.0
 
 
 _REPORT_ASK = "consent purpose=report_sharing Posso condividere il suo referto con il suo medico di base?"
