@@ -23,7 +23,7 @@ ROLES = ("booking_centre", "gp", "hospital", "specialist_care", "family_counseli
 _MAX_PAGE = 8
 # Four agenda hours is about half a minute of real time at 480x, so a slot is still
 # ahead when the citizen decides. One hour was already past by then.
-_LEAD = timedelta(hours=4)
+_LEAD = timedelta(hours=8)  # audit: il cittadino risponde dopo ~3-4 ore di agenda
 # Doctor key (the last segment of doctor_id) -> languages, gender, days. ``*`` is the ASST's
 # rare language. The Ledger's slot line names the doctor; it does not repeat this table.
 _DOCTORS: dict[str, tuple[frozenset[str], str, frozenset[str]]] = {
@@ -63,6 +63,9 @@ _LOG = logging.getLogger("care")
 # the case history and never opens a turn. Wait briefly and read it back from history.
 _PULL_TRIES = 24
 _PULL_PAUSE = 0.25
+# Tetto di tempo reale per ogni attesa sul Ledger: turni corti, la citta' consegna pochi
+# messaggi alla volta per agente e una raffica di cittadini fa coda (audit 04:09 UTC).
+_PULL_BUDGET_S = 5.0
 # Needs whose sent offers this process remembers; the oldest is forgotten first.
 _SENT_NEEDS = 4096
 
@@ -282,6 +285,7 @@ async def _until(
     """Re-read the case until ``ready`` or the short wait ends. The push may never arrive."""
 
     fresh = chat
+    started = asyncio.get_running_loop().time()
     for attempt in range(_PULL_TRIES):
         try:
             fresh = await city.history(need_id=need_id)
@@ -289,8 +293,9 @@ async def _until(
             fresh = chat
         if ready(fresh):
             return fresh
-        if attempt + 1 < _PULL_TRIES:
-            await asyncio.sleep(_PULL_PAUSE)
+        if attempt + 1 >= _PULL_TRIES or asyncio.get_running_loop().time() - started >= _PULL_BUDGET_S:
+            break
+        await asyncio.sleep(_PULL_PAUSE)
     return fresh
 
 
@@ -307,7 +312,9 @@ async def _await_line(
 
     known = {row.msg_id for row in chat}
     fresh = chat
+    started = asyncio.get_running_loop().time()
     for attempt in range(_PULL_TRIES):
+        last = attempt + 1 >= _PULL_TRIES or asyncio.get_running_loop().time() - started >= _PULL_BUDGET_S
         try:
             fresh = await city.history(need_id=need_id)
         except CapError:
@@ -320,8 +327,9 @@ async def _await_line(
                 continue
             if first_word(row.text) == "refused" and op in words(row.text):
                 return row, fresh
-        if attempt + 1 < _PULL_TRIES:
-            await asyncio.sleep(_PULL_PAUSE)
+        if last:
+            break
+        await asyncio.sleep(_PULL_PAUSE)
     return None
 
 
@@ -605,7 +613,7 @@ async def _gp_renew(city: City, message: Message, chat: list[Message], old: str)
 
 # --- GP courtesy line (review: proactivity, tone) -----------------------------------------
 
-_GP_LLM_TIMEOUT_S = 6.0
+_GP_LLM_TIMEOUT_S = 2.0
 _GP_LINE_MAX = 300
 _PROC_LABEL = {
     "VIS-CARD": ("visita cardiologica", "cardiology visit"),
