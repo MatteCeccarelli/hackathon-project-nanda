@@ -3,6 +3,49 @@
 Fonte: console di squadra → Percorsi dei cittadini → Falliti (`/v1/team/journeys`).
 Sabato 21/11, 02:50–03:30. La console è molto lenta (1–2 minuti per percorso): analisi a campione, file aggiornato man mano.
 
+## 🔎 Audit 2 — 04:30–04:45 UTC, 200 percorsi letti uno a uno (messaggi + verdetto)
+
+Fonte: `/v1/team/journeys` + dettaglio di ogni percorso, log degli agenti, `city status`.
+Stato alle 04:41 UTC: **95 aperti · 91 falliti · 9 urgenza · 5 conclusi · 0 prenotati**.
+
+### Fatti nuovi (da sapere prima di tutto)
+
+| # | Fatto | Prova |
+|---|---|---|
+| F1 | **In servizio ci sono le versioni precedenti**: booking **1.0.12**, gp **1.0.6**, family **1.0.6**, specialist **1.0.5**, hospital **1.0.4**. Le card in main dicono 1.0.13 / 1.0.7 / 1.0.7 / 1.0.6 / 1.0.5 → **i «turni corti» (0ccd713: attese 5 s, LLM 2 s, margine 8 h) NON sono in gara** | `city --json status <agente>` alle 04:38 |
+| F2 | **Mercato fermo dalle ~04:32**: console «MERCATO Not started T+00:00:00», agenda ferma a «Gio 13:55», log degli agenti «DRAINING directory». Da allora nessun agente scrive ai cittadini | ultimo invio gp 04:32:02, fam 04:31:48, booking 04:32:22 |
+| F3 | **Tutti i 95 falliti con verdetto hanno la stessa riga negativa: `citizen.booking_centre.wrong_outcome` reason `no_booking` (−1)**; il gp prende `protocol_match` +2 in 98 casi. Non ci sono altre penalità | `verdict.rows` |
+
+### 1) Perché restano «aperti» (in coda)
+
+| Tipo | Quanti | Causa | Priorità | Soluzione |
+|---|---|---|---|---|
+| A. Cittadino ha scritto al booking, **nessuna risposta** | 59 aperti (+36 già falliti) | Coda del booking: risposta p50 **113 s**, p90 **252 s**, max 642 s. Alle 04:26 arriva un'ondata di ~45 `need.request` insieme | **P0** | vedi B + deploy dei turni corti (F1) |
+| B. **Il booking lavora su percorsi già chiusi** | nei log delle 04:37: **100% dei turni su percorsi falliti** (…0922000317, …0922000319, …0002530002, …0002620002, …0001640005) con `relay post` | Ogni turno aperto da una risposta del **Ledger** rientra in `_advance` → `_bc_fresh_clock` richiede `agenda` se la riga ha più di 30 s → sotto coda è sempre «vecchia» → nuova richiesta → nuova risposta → nuovo turno: **ciclo senza fine per ogni percorso toccato**, anche chiuso. In più le rielaborazioni `retryable` (timeout, +10 min). La capacità va ai percorsi morti, i nuovi aspettano | **P0** | 1) Turno aperto dal Ledger: **mai** chiamare `_bc_fresh_clock` né chiedere di nuovo `agenda`. 2) In `_desk`: se l'ultimo messaggio del cittadino ha più di 20 min reali → `return` (percorso chiuso o perso). 3) Valido per tutte le strutture (stesso codice) |
+| C. Cittadino ha scritto al **gp**, nessuna risposta | 19 (1–13 min) | gp lento: p50 **224 s**, p90 248 s (ricetta + attesa Ledger + frase LLM) + mercato fermo (F2) | P1 | turni corti (F1 già in main): attesa Ledger 5 s, LLM 2 s |
+| D. Cittadino ha scritto al **consultorio**, nessuna risposta | 11 (2–15 min) | family: p50 **569 s**, p90 **600 s** = schema «timeout → `retryable` → rielaborato dopo 10 min» | P0 | come B (stesso codice struttura) + turni corti |
+| E. Burst 03:31 senza risposta | 33 (falliti) | arrivati mentre il booking 1.0.10 era muto (02:46–03:37, rollback) | — | nessuna (persi) |
+
+Nota: dal `prescription` del gp alla `need.request` il cittadino aspetta **19–23 min reali** (= ~20 h di agenda). Non dipende da noi.
+
+### 2) Perché le richieste accolte falliscono (95 `no_booking`)
+
+| Causa | Quanti | Cosa succede | Priorità | Soluzione |
+|---|---|---|---|---|
+| **G1. Conferma valida, ma il booking risponde dopo 4–5 min → `cancel reason=expired`** | **45 conferme**, 30 chiuse con solo `cancel expired`, 15 con un'offerta nuova del 4/12 (fuori finestra) | Es. offerta 04:11, il cittadino conferma il 2/12 14:30 alle 04:16, il booking risponde alle **04:20–04:21**: nel frattempo l'agenda ha superato le 14:30 → `expired`. Tutti i casi: …02990002, …02840002, …01510007, …22000313 | **P0** | 1) Togliere la coda (sez. 1B). 2) Sul `confirm` **prima** `hold`/`commit` subito, **poi** il resto (niente rilettura del catalogo prima della presa). 3) Se `expired`: offrire **sempre** il primo posto libero entro la scadenza della priorità, non solo `cancel` |
+| **G2. Offerte già «passate» quando il cittadino risponde** | **239 `cancel reason=past`** | Le offerte del booking 1.0.12 hanno margine 4 h; il cittadino risponde dopo ~5 min (= 5 h). Il 2/12 alle 04:16 tutti annullano 10:30 e 12:00 e confermano 14:30 | **P0** | margine 8 h (in main, **non deployato** F1); meglio margine = ritardo reale misurato × 60 + 3 h |
+| **G3. Dopo i `cancel` del cittadino nessuna nuova offerta** | 13 percorsi (sequenza «offer×N → cancel×N» e poi niente) | Le alternative entro la scadenza sono finite o già offerte (`taken`), oppure il turno è perso nella coda | P1 | dopo l'ultimo `cancel` offrire il primo posto oltre la finestra con `empty_set_alternative` (già vale 0, non −1) oppure altra struttura |
+| **G4. Preferenze ignorate** | 12 `cancel reason=gender`, 12 `reason=day` | Il comfort (giorni/genere) è in main ma non nella 1.0.12 | P2 | arriva con il deploy |
+| **G5. Consultorio: `hold_refused` e conferme senza risposta** | 6 `hold_refused`, 3 conferme mai risposte | Stessa coda (p50 569 s); offerte duplicate (stesso `offer_id` due volte, …0002560003); offerte inviate prima del messaggio del cittadino | P1 | come 1B + idempotenza delle offerte |
+
+### Piano (ordine)
+
+1. **P0 — Rompere il ciclo Ledger** (booking + strutture): nessun `agenda` dai turni aperti dal Ledger; ignorare i percorsi con ultimo messaggio del cittadino > 20 min. Piccolo, locale, testabile con `city run`.
+2. **P0 — Deploy di main** (turni corti + margine 8 h + comfort): oggi in gara c'è la versione precedente (F1). Verificare con `city --json status` dopo il deploy.
+3. **P0 — `confirm` prima di tutto**: presa del posto subito; se scaduto, offerta sostitutiva sempre.
+4. **P1 — Alternative dopo l'ultimo `cancel`** (G3).
+5. Da chiarire con gli organizzatori: mercato fermo dalle 04:32 (F2) e orologio di agenda non lineare (salto notturno: alle 04:16 era ~2/12 13:00, alle 04:34 «Gio 3/12 13:55»).
+
 ## ⚠️ Emergenza (03:36 UTC / 04:36 CET)
 
 **Il centro prenotazioni non risponde dalle 02:46 UTC (03:46 CET).**
