@@ -102,7 +102,13 @@ async def main(need: Need, city: City) -> None:
         # Kit E19: con need.is_emergency si segnala l'emergenza e ci si ferma (-2 se manca).
         await city.say(message.sender, "escalate.emergency reason=red_flag")
         return
-    case = await city.history(need_id=message.need_id)
+    if message.need_id is None and not message.text and not message.sender.startswith("citizen:"):
+        # Senza caso e senza testo (need.request strutturata, es. la conformance) nessun ramo
+        # di handle() usa la storia: si evita la lettura dell'intera casella (5 pagine dal Relay),
+        # che ritarda il renew oltre i 5 s attesi dalla conformance.
+        case = [message]
+    else:
+        case = await city.history(need_id=message.need_id)
     await handle(role, city, message, case)
 
 
