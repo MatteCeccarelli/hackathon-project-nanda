@@ -54,7 +54,18 @@ Nota: dal `prescription` del gp alla `need.request` il cittadino aspetta **19–
 | G1. Confirm lento | Il `confirm` parte subito se il posto è chiaramente lontano (stima agenda ×60 + 1 h di margine); il giro di `agenda` resta solo per i posti vicini | booking, consultorio |
 
 Test: compilazione ok, 5 casi della regola verificati (attesa prime offerte → lavora; già risposto / confermato / silenzio 25 min → si ferma; cancel senza offerte → lavora), card valide. `city run` locale uguale a prima (il Ledger locale non risponde ad `agenda`: flusso reale non testabile qui).
-Restano: P0 deploy di main (F1), P1 alternative dopo l'ultimo `cancel` (G3), domande agli organizzatori (F2).
+Restano: P0 deploy di main (F1), domande agli organizzatori (F2).
+
+### ✅ Hot-fix P1/P2 fatto (in main, **non deployato**)
+
+| Problema | Cosa cambia | Agenti |
+|---|---|---|
+| G3. Silenzio dopo l'ultimo `cancel` | Se non c'è più un posto locale adatto e nessuna altra ASST da interrogare, offerta di lista d'attesa una sola volta (`empty_set_alternative` 0 invece di `no_booking` −1) | booking |
+| G5. Consultorio: offerte doppie | Coperto dal fix P0 (i turni del Ledger non rifanno offerte già inviate). `hold_refused` = posto preso da altri: resta | consultorio |
+| G4. Preferenze genere/giorno (P2) | Nessun codice nuovo: il comfort è già in main, arriva con il deploy | booking |
+| C. GP lento (P1) | Nessun codice nuovo: turni corti già in main, arrivano con il deploy | gp |
+
+Test: compilazione, card valida, offerta di lista d'attesa provata con un finto `say` (una sola volta anche se richiamata). Non testabile in locale: ricerca esaurita con il Ledger reale.
 
 ## ⚠️ Emergenza (03:36 UTC / 04:36 CET)
 
