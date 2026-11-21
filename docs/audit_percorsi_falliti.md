@@ -46,6 +46,16 @@ Nota: dal `prescription` del gp alla `need.request` il cittadino aspetta **19–
 4. **P1 — Alternative dopo l'ultimo `cancel`** (G3).
 5. Da chiarire con gli organizzatori: mercato fermo dalle 04:32 (F2) e orologio di agenda non lineare (salto notturno: alle 04:16 era ~2/12 13:00, alle 04:34 «Gio 3/12 13:55»).
 
+### ✅ Hot-fix P0 fatto (commit a9da3da, in main locale, **non deployato**)
+
+| Problema | Cosa cambia | Agenti |
+|---|---|---|
+| B. Ciclo Ledger | Il turno aperto da una risposta del Ledger si ferma se il cittadino tace da > 20 min, se ha già avuto risposta (salvo un nostro `cancel` senza offerte nuove) o se ha appena confermato. Niente più `agenda` dai turni del Ledger. Sostituzione dopo un `cancel` una sola volta per evento | booking, consultorio |
+| G1. Confirm lento | Il `confirm` parte subito se il posto è chiaramente lontano (stima agenda ×60 + 1 h di margine); il giro di `agenda` resta solo per i posti vicini | booking, consultorio |
+
+Test: compilazione ok, 5 casi della regola verificati (attesa prime offerte → lavora; già risposto / confermato / silenzio 25 min → si ferma; cancel senza offerte → lavora), card valide. `city run` locale uguale a prima (il Ledger locale non risponde ad `agenda`: flusso reale non testabile qui).
+Restano: P0 deploy di main (F1), P1 alternative dopo l'ultimo `cancel` (G3), domande agli organizzatori (F2).
+
 ## ⚠️ Emergenza (03:36 UTC / 04:36 CET)
 
 **Il centro prenotazioni non risponde dalle 02:46 UTC (03:46 CET).**
