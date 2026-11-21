@@ -1295,7 +1295,7 @@ async def _advance_alone(
             return
         if fixed is None and state not in (None, "issued"):
             return
-        if fixed is None and not _exact(chat, agent, "rules"):
+        if fixed is None and not _exact(chat, agent, "rules") and not _rules_fresh():
             # Regole in vigore (P1: ricette valide 2 giorni di agenda), lette una volta.
             await _say(city, LEDGER, "rules")
         agenda = _ledger(chat, "agenda")
@@ -2034,7 +2034,32 @@ _RX_ISSUED_KEYS = ("issued_at", "issued", "agenda_issued", "issue_date", "create
 _RX_EXPIRY_KEYS = ("expires_at", "valid_until", "expiry", "expires")
 
 
+_RULES_CACHE: dict[str, object] = {"text": "", "at": 0.0}
+_RULES_TTL_S = 300.0
+
+
+def _rules_fresh() -> bool:
+    """Audit 4: le regole si leggono una volta ogni 5 minuti per processo, non per cittadino:
+    ogni risposta del Ledger in piu' e' una consegna in piu' nella coda del booking."""
+    import time
+    return bool(_RULES_CACHE["text"]) and time.monotonic() - float(_RULES_CACHE["at"]) < _RULES_TTL_S
+
+
+def _note_rules(chat: list[Message]) -> None:
+    import time
+    for row in reversed(chat):
+        if row.sender == LEDGER and first_word(row.text) == "rules":
+            if row.text != _RULES_CACHE["text"] or not _rules_fresh():
+                _RULES_CACHE["text"] = row.text
+                _RULES_CACHE["at"] = time.monotonic()
+            return
+
+
 def _p1_active(chat: list[Message]) -> bool:
+    _note_rules(chat)
+    cached = str(_RULES_CACHE["text"]) if _rules_fresh() else ""
+    if cached and "P1" in cached.replace("=", " ").split():
+        return True
     return any(
         row.sender == LEDGER and first_word(row.text) == "rules" and "P1" in row.text.replace("=", " ").split()
         for row in chat
