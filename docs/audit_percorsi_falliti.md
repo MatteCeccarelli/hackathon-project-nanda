@@ -108,6 +108,83 @@ Nuovi schemi:
 - 9 falliti su 11 sono «offerte del 1° dicembre rifiutate come passate, poi silenzio»: …0922000318, …0922000319, …0002720002.
 - I 5 cittadini che hanno ricevuto alle 04:00 la nuova offerta del 3 dicembre non hanno ancora risposto (…0002690002): il ciclo `confirm` → nuova offerta resta aperto.
 
+### Giro 4 — 04:15 UTC
+
+Correzione al giro 3: le 45 richieste «delle 03:53» ora risultano inviate alle ~04:09 (la console ha cambiato l'ora del messaggio, es. …0002980002: 03:53:32 → 04:09:33). Quindi non aspettavano da 16 minuti. Resta vero che il centro risponde a pochissimi.
+
+**⚠️ Il centro prenotazioni è in coda.** Richieste ricevute e risposte, per fascia di 10 minuti:
+
+| Fascia (UTC) | Richieste al centro | Con risposta | Tempo prima risposta |
+|---|---|---|---|
+| 03:40–03:50 | 4 | 2 | ~10,5 min |
+| 03:50–04:00 | 16 | **16** | ~1,3 min |
+| 04:00–04:10 | 55 | **3** | 1–8 min |
+| 04:10–04:15 | 36 | **0** | — |
+
+Messaggi del centro ai cittadini: 37 (03:50–04:00) → 18 (04:00–04:10) → 1 (dopo le 04:10, ultimo alle 04:10:28). `/v1/logs` del centro di nuovo `503 DRAINING` alle 04:15. Lo `city scale` delle 04:12 non si vede ancora nei percorsi.
+
+| Voce | Prima del fix | 04:15 (111 percorsi dopo 03:39) |
+|---|---|---|
+| Ricevute | 0 su 104 | **0** |
+| Tempo mediano prima risposta | 5–10 min | 1,4 min sulle 21 risposte; 90 richieste ancora senza risposta |
+| Chiusi | — | 14 (invariato): 3 conclusi con lista d'attesa · 11 falliti |
+| `no_booking` | 64 su 78 falliti | 9 su 11 |
+| `hold` scaduti | 10 su 10 | 0 (nessun `confirm` arrivato a buon fine) |
+| Escalation mancate | 1 | 0 |
+
+- Il ciclo `confirm` → nuova offerta continua: i 5 cittadini dell'offerta del 3 dicembre (ricevuta alle 04:00) l'hanno confermata solo alle 04:13 (13 min dopo); …0002590002 ha confermato alle 04:03:59 e alle 04:07:56 ha ricevuto un'altra offerta invece della ricevuta. 8 `confirm` in attesa di risposta.
+- Da qui controllo anche le **offerte doppie** (rischio segnalato con le repliche).
+
+### Giro 5 — 04:20 UTC
+
+**Dopo lo `city scale` (04:12) il centro ha smaltito la coda:** 101 messaggi ai cittadini tra 04:10 e 04:14 (contro 18 nei 10 minuti prima). Ultimo messaggio visto alle 04:14:09. `/v1/logs` del centro sempre `503 DRAINING` (04:15, 04:19): non posso confermare dai log.
+
+| Fascia (UTC) | Richieste al centro | Con risposta | Tempo mediano prima risposta |
+|---|---|---|---|
+| 03:50–04:00 | 16 | 16 | 1,4 min |
+| 04:00–04:10 | 54 | **44** (prima 3) | 1,9 min |
+| 04:10–04:20 | 38 | 0 | — |
+
+| Voce | Prima del fix | 04:20 (112 percorsi dopo 03:39) |
+|---|---|---|
+| Ricevute | 0 su 104 | **0** |
+| Tempo mediano prima risposta | 5–10 min | 1,9 min (62 risposte) |
+| Chiusi | — | 14 (invariato) |
+| `no_booking` | 64 su 78 falliti | 9 su 11 |
+| `confirm` senza risposta | 18 su 78 | **43** (inviati 04:11–04:17, in attesa) |
+| `hold` scaduti | 10 su 10 | 0 |
+| Escalation mancate | 1 | 0 |
+| Offerte doppie | — | 0 |
+
+- **Il cittadino risponde alle offerte dopo ~5 min reali** (= ~5 ore di agenda). Le offerte delle 04:11 (2 dicembre 10:30–16:00) sono già «passate» per metà quando arrivano le risposte delle 04:16: il cittadino annulla 10:30 e 12:00 con `reason=past` e conferma 14:30. Esempi: …0002840002, …0922000313 (confermato alle 04:12:59 il posto delle 10:30, ormai a rischio). 56 percorsi su 112 contengono `reason=past`.
+- Con il margine di 4 ore di agenda le prime offerte scadono sempre prima della risposta: il nuovo margine di 8 ore (commit 0ccd713) va verificato appena in servizio.
+
+### Giro 6 — 04:24 UTC
+
+Log del centro di nuovo leggibili alle 04:23 (attivo: `brain begin`, `relay post`). Nei percorsi però l'ultimo messaggio del centro è delle **04:18:02**.
+
+| Fascia (UTC) | Richieste al centro | Con risposta | Tempo mediano prima risposta |
+|---|---|---|---|
+| 04:00–04:10 | 51 | 45 | 1,9 min |
+| 04:10–04:20 | 39 | **1** | 2,7 min |
+| 04:20–04:24 | 5 | 0 | — |
+
+| Voce | Prima del fix | 04:24 (115 percorsi dopo 03:39) |
+|---|---|---|
+| Ricevute | 0 su 104 | **0** |
+| Tempo mediano prima risposta | 5–10 min | 1,9 min (64 risposte) |
+| Chiusi | — | 21: 3 conclusi (lista d'attesa) · 18 falliti |
+| `no_booking` | 64 su 78 falliti | 11 (altri 7 falliti senza ancora il giudizio) |
+| `confirm` senza risposta | 18 su 78 | 37 |
+| Risposta al `confirm` | — | 3,5–5 min; mai una ricevuta |
+| `hold` scaduti | 10 su 10 | 0 nei fatti del giudice |
+| Escalation mancate | 1 | 0 |
+| Offerte doppie | — | 0 |
+
+- **✅ Il nuovo `cancel reason=expired` funziona** (3 percorsi: …0922000317, …0002620002, …0922000313). **Ma arriva dopo la nuova offerta**, non prima: in …0922000317 nuova offerta alle 04:15:35, `cancel` del posto confermato alle 04:18:02 (2,5 min dopo). Sembrano due turni separati invece di uno.
+- **`cancel reason=hold_refused`** dopo il `confirm`: la struttura rifiuta la presa del posto, il centro annulla e manda un'altra offerta. Dopo il fix: …0922000320 (04:06, poi fallito). Lo schema c'era già prima (…0002270003, …0001970004 alle 03:54).
+- 7 nuovi falliti tutti con offerte rifiutate come `past`: …0002980002, …0002960002, …0922000323.
+
 ## ❗ Problema aperto dopo `hot-fix/audit-p0` (04:05 UTC)
 
 | Voce | Dettaglio |
