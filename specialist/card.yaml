@@ -1,7 +1,7 @@
 agent_id: agent:cgj1c2mf1dx0
 team: team:t-5-gin-tokens
 name: specialist
-version: 1.0.4
+version: 2.0.0
 cap_versions:
   - "1.0"
 profiles:

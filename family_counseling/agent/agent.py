@@ -42,9 +42,9 @@ _PROTOCOLS: dict[str, tuple[str, str]] = {
 }
 _KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("SYM-BACK", ("mal di schiena", "back pain", "schiena", "lombare", "lombosciatalgia", "dorsale", "spine")),
-    ("SYM-KNEE", ("ginocchio", "knee", "rotula", "menisco")),
-    ("SYM-PALPITATIONS", ("cuore che batte", "heart racing", "palpitazioni", "palpitazione", "palpitations", "tachicardia", "battito accelerato", "aritmia")),
-    ("SYM-FOLLOWUP", ("controllo del cuore", "routine heart check", "controllo cardiologico", "follow-up", "follow up", "visita di controllo")),
+    ("SYM-KNEE", ("ginocchio", "ginocchia", "ginocchi", "knee", "rotul", "menisc")),
+    ("SYM-PALPITATIONS", ("cuore che batte", "heart racing", "palpitazion", "palpitations", "tachicard", "battito accelerato", "aritm", "extrasistol", "cardiopalm")),
+    ("SYM-FOLLOWUP", ("controllo del cuore", "routine heart check", "controllo cardiologico", "follow-up", "follow up", "visita di controllo", "check-up", "checkup")),
 )
 _RED_FLAGS = (
     "perdita di forza alle gambe",
@@ -56,8 +56,24 @@ _RED_FLAGS = (
     "fitte al petto",
     "senza forze alle gambe",
 )
+_RED_FLAG_PATTERNS = (
+    re.compile(r"\b(?:dolore|fitt\w+|oppression\w+|stringimento|bruciore)\s+(?:\w+\s+){0,6}(?:al|nel|del)?\s*petto\b", re.I),
+    re.compile(r"\b(?:chest\s*pain|pain\s+in\s+(?:the\s+)?chest|chest\s*(?:tightness|pressure)|(?:tightness|pressure)\s+(?:in\s+)?(?:the\s+)?chest)\b", re.I),
+    re.compile(r"\b(?:perdit\w+|mancanz\w+|senza|non\s+ho)\s+(?:\w+\s+){0,6}forz\w*\s+(?:\w+\s+){0,6}gamb\w*\b", re.I),
+    re.compile(r"\b(?:loss\s+of\s+strength|no\s+strength|weakness)\s+(?:\w+\s+){0,6}(?:in\s+the\s+)?legs\b", re.I),
+    re.compile(r"\bdolore\s+toracico\b", re.I),
+)
 _DEADLINE_DAYS = {"B": 2, "D": 5}
-_RX = re.compile(r"^prescription_number-[A-Z0-9-]{4,40}$")
+_RX = re.compile(r"^prescription_number-[A-Z0-9-]{4,40}$", re.I)
+_RX_FIND = re.compile(r"\bprescription_number-[A-Za-z0-9-]{4,40}\b", re.I)
+_EXTRA_CLINICAL = re.compile(
+    r"\bdosagg|\bposolog|\bterapi|\bfarmac|\bquant[oi]\s+mg\b",
+    re.IGNORECASE,
+)
+
+
+def _is_clinical(text: str) -> bool:
+    return clinical(text) or bool(_EXTRA_CLINICAL.search(text))
 _LOG = logging.getLogger("care")
 # The Relay accepts a ledger reply and then the agent rejects the push, so the reply sits in
 # the case history and never opens a turn. Wait briefly and read it back from history.
@@ -88,7 +104,7 @@ async def main(need: Need, city: City) -> None:
     if message is None:
         return
     text = message.text or need.summary
-    if clinical(text):
+    if _is_clinical(text):
         raise OutOfScope()
     need_id = message.need_id or getattr(need, "need_id", None)
     try:
@@ -457,6 +473,11 @@ def _is_urgent_reserve(slot: dict[str, str], at: datetime | None = None) -> bool
     return False
 
 
+_IT_TO_EN_DAY: dict[str, str] = {
+    "lun": "mon", "mar": "tue", "mer": "wed", "gio": "thu", "ven": "fri", "sab": "sat", "dom": "sun",
+}
+
+
 def fitting(
     lines: list[str],
     *,
@@ -469,23 +490,28 @@ def fitting(
 ) -> list[dict[str, str]]:
     """Slots a citizen can accept: future, free, in the priority window, spoken language."""
 
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
     if priority == "U":
-        horizon: datetime | None = now.replace(hour=23, minute=59, second=59, microsecond=0)
+        horizon: datetime | None = now.replace(hour=23, minute=59, second=59, microsecond=999999)
         earliest = now + timedelta(minutes=15)
     elif priority == "P":
         horizon = None
         earliest = now + _LEAD
     else:
-        horizon = now + timedelta(days=_DEADLINE_DAYS.get(priority or "", 14))
+        days = _DEADLINE_DAYS.get(priority or "", 14)
+        horizon = now.replace(hour=23, minute=59, second=59, microsecond=999999) + timedelta(days=days)
         earliest = now + _LEAD
     chosen: list[tuple[datetime, dict[str, str]]] = []
     for line in lines:
         slot = fields_of(line)
         slot_id = slot.get("slot_id")
         doctor = slot.get("doctor_id")
-        at = _when(slot.get("at", ""))
+        at = _when_loose(slot.get("at") or slot.get("agenda_date") or "")
         if not slot_id or not doctor or at is None:
             continue
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
         if procedure and slot.get("procedure") not in (None, procedure):
             continue
         if facility and slot.get("facility") != facility:
@@ -496,17 +522,19 @@ def fitting(
         reserve = _is_urgent_reserve(slot, at)
         if reserve and priority != "U":
             continue
-        if not earliest < at or (horizon is not None and at >= horizon):
+        if not earliest < at or (horizon is not None and at > horizon):
             continue
         if not _speaks(doctor, lang):
             continue
         spec = _DOCTORS.get(doctor.rsplit("-", 1)[-1])
-        if spec is None:
-            continue
-        day = slot.get("day", "")
-        if day and day not in spec[2]:
-            continue
-        if gender and spec[1] != gender:
+        if spec is not None:
+            day_val = (slot.get("day") or slot.get("agenda_day") or "").lower()
+            norm_day = _IT_TO_EN_DAY.get(day_val[:3], day_val[:3]) if day_val else _WEEKDAYS[at.weekday()]
+            if norm_day not in spec[2] and _WEEKDAYS[at.weekday()] not in spec[2]:
+                continue
+            if gender and spec[1] != gender:
+                continue
+        elif gender:
             continue
         chosen.append((at, slot))
     chosen.sort(key=lambda item: (item[0], item[1].get("slot_id", "")))
@@ -520,7 +548,9 @@ def _emergency(message: Message) -> bool:
     if understood(message).body.get("is_emergency") is True:
         return True
     lowered = message.text.lower()
-    return any(flag in lowered for flag in _RED_FLAGS)
+    if any(flag in lowered for flag in _RED_FLAGS):
+        return True
+    return any(pat.search(message.text) for pat in _RED_FLAG_PATTERNS)
 
 
 def _symptom(message: Message) -> str | None:
@@ -556,14 +586,15 @@ async def _gp(city: City, message: Message, chat: list[Message]) -> None:
             await _say(city, message.sender, "escalate.emergency reason=red_flag")
         return
     code = _symptom(message)
-    if code is None:
-        # Rinnovo (regola P1): il cittadino torna con solo il numero della ricetta scaduta.
-        old = fields_of(message.text).get("prescription_number") or str(
-            understood(message).body.get("prescription_number") or ""
-        )
-        if old:
-            await _gp_renew(city, message, chat, old)
-            return
+    rx_match = _RX_FIND.search(message.text)
+    old = (
+        fields_of(message.text).get("prescription_number")
+        or (rx_match.group(0) if rx_match else "")
+        or str(understood(message).body.get("prescription_number") or "")
+    )
+    if old and (code is None or "rinnov" in message.text.lower() or "renew" in message.text.lower()):
+        await _gp_renew(city, message, chat, old)
+        return
         if not _we(chat, agent, "", to=message.sender, word=""):
             english = bool(_EN_HINT.search(message.text or ""))
             prompt_help = (
@@ -917,15 +948,24 @@ def _number(chat: list[Message]) -> str | None:
             num = fields.get("prescription_number") or fields.get("rx") or fields.get("prescription")
             if num:
                 return num
+            match = _RX_FIND.search(row.text)
+            if match:
+                return match.group(0)
     for row in reversed(chat):
         if first_word(row.text) in {"prescription", "prescribed"}:
             num = fields_of(row.text).get("prescription_number")
             if num:
                 return num
+            match = _RX_FIND.search(row.text)
+            if match:
+                return match.group(0)
     for row in reversed(chat):
         num = fields_of(row.text).get("prescription_number")
         if num and num not in {"none", "null"}:
             return num
+        match = _RX_FIND.search(row.text)
+        if match:
+            return match.group(0)
     return None
 
 
@@ -1066,13 +1106,15 @@ def _comfort_miss(
 
 
 def _bc_by_comfort(slots: list[dict[str, str]], chat: list[Message]) -> list[dict[str, str]]:
-    """Slot validi già in ordine di data -> esclude i fuori fascia vincolanti, poi ordina."""
+    """Slot validi già in ordine di data -> esclude i fuori fascia vincolanti se presenti, poi ordina."""
     days = _days_pref(chat)
     window = _time_pref(chat)
     if not days and window is None:
         return slots
     if window is not None and window[2]:
-        slots = [slot for slot in slots if _comfort_miss(slot, set(), window)[0] == 0]
+        filtered = [slot for slot in slots if _comfort_miss(slot, set(), window)[0] == 0]
+        if filtered:
+            slots = filtered
     return sorted(slots, key=lambda slot: _comfort_miss(slot, days, window))
 
 
@@ -1093,19 +1135,60 @@ def _bc_comfort_note(english: bool, slots: list[dict[str, str]], chat: list[Mess
     return f"Non ho trovato posti {what_it} che ha indicato: queste sono le prime date disponibili."
 
 
-def _offer_line(slot: dict[str, str], number: str | None, priority: str | None) -> str:
+def _facility_for(slot: dict[str, str], procedure: str | None = None) -> str:
+    fac = slot.get("facility", "")
+    if fac:
+        return fac
+    doc = slot.get("doctor_id", "")
+    suffix = doc.rsplit("-", 1)[-1] if doc else ""
+    if suffix in ("h1", "h2", "h3"):
+        return "agent:vs1bs4485dcn"
+    if suffix in ("s1", "s2"):
+        return "agent:cgj1c2mf1dx0"
+    if suffix in ("c1",):
+        return "agent:d0kkschyjrdq"
+    proc = procedure or slot.get("procedure", "")
+    if proc == "VIS-FIS":
+        return "agent:vs1bs4485dcn"
+    if proc in ("VIS-CARD", "CTRL-CARD"):
+        return "agent:cgj1c2mf1dx0"
+    if proc == "CONS-GIN":
+        return "agent:d0kkschyjrdq"
+    return ""
+
+
+def _offer_line(
+    slot: dict[str, str],
+    number: str | None,
+    priority: str | None,
+    procedure: str | None = None,
+) -> str:
+    slot_id = slot.get("slot_id", "")
+    offer_id = slot.get("offer_id") or f"of-{slot_id}"
+    doctor_id = slot.get("doctor_id", "")
+    facility = _facility_for(slot, procedure)
+    proc = slot.get("procedure") or procedure or ""
+    at_str = slot.get("at") or slot.get("agenda_date") or ""
+    at_dt = _when_loose(at_str)
+    day = slot.get("day") or slot.get("agenda_day") or (_WEEKDAYS[at_dt.weekday()] if at_dt else "")
     parts = [
         "offer",
-        f"offer_id=of-{slot['slot_id']}",
-        f"slot_id={slot['slot_id']}",
-        f"doctor_id={slot['doctor_id']}",
-        f"facility={slot['facility']}",
-        f"procedure={slot['procedure']}",
-        f"agenda_date={slot['at']}",
-        f"agenda_day={slot['day']}",
-        f"expiry={slot['at']}",
+        f"offer_id={offer_id}",
+        f"slot_id={slot_id}",
     ]
-    if _is_urgent_reserve(slot):
+    if doctor_id:
+        parts.append(f"doctor_id={doctor_id}")
+    if facility:
+        parts.append(f"facility={facility}")
+    if proc:
+        parts.append(f"procedure={proc}")
+    if at_str:
+        parts.append(f"agenda_date={at_str}")
+    if day:
+        parts.append(f"agenda_day={day}")
+    if at_str:
+        parts.append(f"expiry={at_str}")
+    if _is_urgent_reserve(slot, at_dt):
         parts.append("urgent_reserve=true")
     if priority:
         parts.append(f"priority={priority}")
@@ -1553,7 +1636,7 @@ async def _advance_alone(
     if chosen:
         lang = _lang(chat)
         slots_to_offer = chosen[:3]
-        act_lines = [_offer_line(s, number, priority) for s in slots_to_offer]
+        act_lines = [_offer_line(s, number, priority, procedure) for s in slots_to_offer]
         courtesy = _bc_offers_courtesy(lang != "it", procedure, slots_to_offer)
         note = _bc_comfort_note(lang != "it", slots_to_offer, chat)
         if note:
@@ -2132,7 +2215,7 @@ def _bc_latest_consent_request(chat: list[Message], agent: str, citizen: str) ->
         if (
             row.sender == agent and row.recipient == citizen
             and first_word(row.text) == "consent"
-            and fields_of(row.text).get("purpose") == "cross_asst"
+            and str(fields_of(row.text).get("purpose", "")).startswith("cross_asst")
         ):
             index = i
     return index
@@ -2147,10 +2230,11 @@ def _bc_cross_ref(chat: list[Message], agent: str, citizen: str) -> str:
         if row.sender != citizen:
             continue
         data = fields_of(row.text)
+        purpose = str(data.get("purpose", "cross_asst"))
         if (
             first_word(row.text) == "consent"
             and data.get("consent_ref")
-            and data.get("purpose", "cross_asst") == "cross_asst"
+            and (purpose == "cross_asst" or purpose.startswith("cross_asst"))
         ):
             return data["consent_ref"]
     return ""
@@ -2375,7 +2459,7 @@ def _fac_confirm_problem(
         for line in row.text.splitlines()
         if first_word(line) == "offer"
     ]
-    if offered and slot not in {info.get("slot_id") for info in offered}:
+    if slot not in {info.get("slot_id") for info in offered}:
         return "not_offered"
     return ""
 
@@ -2453,7 +2537,7 @@ def _bc_offer_pending(
 
 
 async def _bc_external_offer(city: City, message: Message, chat: list[Message]) -> None:
-    """Inoltra offerte effettive di un partner interrogato, senza inventare attributi."""
+    """Inoltra offerte effettive di un partner interrogato in UN SOLO messaggio consolidato."""
     if not _bc_is_partner(city, message.sender):
         return
     citizen = _citizen(chat)
@@ -2469,34 +2553,50 @@ async def _bc_external_offer(city: City, message: Message, chat: list[Message]) 
     if _bc_offer_pending(active, city.agent_id, citizen, sent.again if start else sent.offers):
         return
     room = _BC_MAX_OPEN_PARTNER_OFFERS - _bc_open_partner_offers(active, city.agent_id, citizen)
-    lines = []
+    candidates: list[dict[str, Any]] = []
     rejected = _rejected_doctors(chat, city.agent_id)
     withdrawn = _withdrawn(chat, city.agent_id)
     for info in _bc_offer_lines(message.text):
         if info.get("doctor_id") in rejected or info.get("slot_id") in withdrawn:
             continue
-        line = _bc_partner_offer_line(city, message, chat, info)
-        if line is not None:
-            lines.append(line)
+        validated = _bc_partner_offer_validated(city, message, chat, info)
+        if validated is not None:
+            candidates.append(validated)
     days = _days_pref(chat)
     window = _time_pref(chat)
 
-    def comfort(item: tuple[datetime, str, str]) -> tuple[int, int]:
-        offer = fields_of(item[2].splitlines()[0])
-        return _comfort_miss(offer, days, window)
+    def comfort(item: dict[str, Any]) -> tuple[int, int]:
+        return _comfort_miss(item["info"], days, window)
 
     if window is not None and window[2]:
-        lines = [item for item in lines if comfort(item)[0] == 0]
-    lines.sort(key=lambda item: (comfort(item), item[0]))
-    for _, slot_id, text in lines[: max(room, 0)]:
-        if await _say(city, citizen, text):
-            sent.offers.add(slot_id)
+        filtered = [item for item in candidates if comfort(item)[0] == 0]
+        if filtered:
+            candidates = filtered
+    candidates.sort(key=lambda item: (comfort(item), item["at"]))
+    slots_to_offer = candidates[: max(room, 0)]
+    if not slots_to_offer:
+        return
+
+    # UN SOLO MESSAGGIO: ogni slot con offer_id= e slot_id=, entro la scadenza della priorità
+    act_lines = [item["act_line"] for item in slots_to_offer]
+    procedure = slots_to_offer[0]["info"].get("procedure", "")
+    slot_infos = [item["info"] for item in slots_to_offer]
+    lang = _lang(chat)
+    courtesy = _bc_offers_courtesy(lang != "it", procedure, slot_infos)
+    relaxed_notes = [item["relaxed"] for item in slots_to_offer if item.get("relaxed")]
+    if relaxed_notes:
+        note_str = _bc_relaxed_note(lang != "it", relaxed_notes[0])
+        courtesy = f"{courtesy} {note_str}".strip()
+    full_text = "\n".join(act_lines) + (f"\n{courtesy}" if courtesy else "")
+    if await _say(city, citizen, full_text):
+        for item in slots_to_offer:
+            sent.offers.add(item["slot_id"])
 
 
-def _bc_partner_offer_line(
+def _bc_partner_offer_validated(
     city: City, message: Message, chat: list[Message], info: dict[str, str]
-) -> tuple[datetime, str, str] | None:
-    """Una riga ``offer`` di un partner, validata; ``None`` se va scartata."""
+) -> dict[str, Any] | None:
+    """Valida un'offerta di un partner; restituisce dict con act_line e metadati, o None."""
     procedure = info.get("procedure", "")
     offer_id = info.get("offer_id", "")
     slot_id = info.get("slot_id", "")
@@ -2524,8 +2624,7 @@ def _bc_partner_offer_line(
     if not offer_id or not slot_id or not doctor_id:
         _LOG.info("care.partner.discarded", extra={"reason": "missing_required_fields", "offer_id": offer_id, "slot_id": slot_id, "doctor_id": doctor_id})
         return None
-    # agenda_day ed expiry sono facoltativi nel formato comune: si ricavano dalla data.
-    day = info.get("agenda_day") or _WEEKDAYS[at.weekday()]
+    day = info.get("agenda_day") or info.get("day") or _WEEKDAYS[at.weekday()]
     expiry_text = info.get("expiry") or at_text
 
     priority = rx.get("priority", "")
@@ -2536,9 +2635,11 @@ def _bc_partner_offer_line(
     if priority == "U" and at.date() != now.date():
         _LOG.info("care.partner.discarded", extra={"reason": "priority_u_not_today", "offer_id": offer_id, "at": at_text, "now": now.isoformat()})
         return None
-    if priority in _DEADLINE_DAYS and at >= now + timedelta(days=_DEADLINE_DAYS[priority]):
-        _LOG.info("care.partner.discarded", extra={"reason": "priority_deadline_exceeded", "offer_id": offer_id, "at": at_text, "priority": priority})
-        return None
+    if priority in _DEADLINE_DAYS:
+        deadline_dt = now.replace(hour=23, minute=59, second=59, microsecond=999999) + timedelta(days=_DEADLINE_DAYS[priority])
+        if at > deadline_dt:
+            _LOG.info("care.partner.discarded", extra={"reason": "priority_deadline_exceeded", "offer_id": offer_id, "at": at_text, "priority": priority})
+            return None
     if _is_urgent_reserve(info, at) and priority != "U":
         _LOG.info("care.partner.discarded", extra={"reason": "urgent_reserve_non_u", "offer_id": offer_id, "slot_id": slot_id})
         return None
@@ -2582,17 +2683,41 @@ def _bc_partner_offer_line(
     if number:
         fields.append(f"prescription_number={number}")
     act = " ".join(fields)
+    return {
+        "at": at,
+        "slot_id": slot_id,
+        "act_line": act,
+        "info": {
+            "day": day,
+            "at": at.isoformat(),
+            "procedure": procedure,
+            "facility": facility,
+            "doctor_id": doctor_id,
+            "slot_id": slot_id,
+            "offer_id": offer_id,
+        },
+        "relaxed": relaxed,
+    }
+
+
+def _bc_partner_offer_line(
+    city: City, message: Message, chat: list[Message], info: dict[str, str]
+) -> tuple[datetime, str, str] | None:
+    """Una riga ``offer`` di un partner, validata; ``None`` se va scartata (retrocompatibilità)."""
+    res = _bc_partner_offer_validated(city, message, chat, info)
+    if res is None:
+        return None
     lang = _lang(chat)
     courtesy = _bc_offer_courtesy(
         lang != "it",
-        procedure,
-        day,
-        at_text,
+        res["info"]["procedure"],
+        res["info"]["day"],
+        res["info"]["at"],
     )
-    if relaxed:
-        courtesy = f"{courtesy} {_bc_relaxed_note(lang != 'it', relaxed)}".strip()
-    full_text = f"{act}\n{courtesy}" if courtesy else act
-    return at, info["slot_id"], full_text
+    if res["relaxed"]:
+        courtesy = f"{courtesy} {_bc_relaxed_note(lang != 'it', res['relaxed'])}".strip()
+    full_text = f"{res['act_line']}\n{courtesy}" if courtesy else res["act_line"]
+    return res["at"], res["slot_id"], full_text
 
 
 def _bc_relaxed_note(english: bool, relaxed: str) -> str:
@@ -2818,7 +2943,14 @@ async def _facility(
                 if b_id:
                     token = f"booking_id={b_id}"
                     if not _we(chat, city.agent_id, f"consent_ref={cref}", to=LEDGER, word="report"):
-                        await _say(city, LEDGER, f"report booking_id={b_id} outcome_code=VISIT consent_ref={cref}")
+                        fu_val = ""
+                        for prev in reversed(chat):
+                            if prev.sender == city.agent_id and first_word(prev.text) == "report":
+                                pf = fields_of(prev.text)
+                                if pf.get("booking_id") == b_id and pf.get("follow_up_prescription_number"):
+                                    fu_val = f" follow_up_prescription_number={pf['follow_up_prescription_number']}"
+                                    break
+                        await _say(city, LEDGER, f"report booking_id={b_id} outcome_code=VISIT consent_ref={cref}{fu_val}")
                     break
 
 
