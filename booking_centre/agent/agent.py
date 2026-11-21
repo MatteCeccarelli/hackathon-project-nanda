@@ -1480,7 +1480,38 @@ async def _forward_receipt(city: City, message: Message, chat: list[Message]) ->
         for row in chat
     ):
         return
-    await _say(city, citizen, f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}")
+    note = _bc_receipt_note(chat, city.agent_id, message.sender)
+    await _say(city, citizen, f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}{note}")
+
+
+_BC_DAYS_IT = ("lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica")
+_BC_DAYS_EN = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+
+def _bc_receipt_note(chat: list[Message], agent: str, facility: str) -> str:
+    """Frase utile accanto alla ricevuta (proattività): giorno e ora, mezza giornata in cui
+    presentarsi, cosa portare. Niente contenuti clinici, niente '=' né parole-atto."""
+    offer: dict[str, str] = {}
+    for row in reversed(chat):
+        if row.sender == agent and row.recipient == facility and "confirm" in words(row.text):
+            offer = _our_offer(chat, agent, fields_of(row.text).get("offer_id", ""))
+            break
+    at = _when_loose(offer.get("agenda_date", "")) if offer else None
+    english = _lang(chat) != "it"
+    if at is None:
+        return ("\nYour visit is booked. Please bring your health card and your prescription number."
+                if english else
+                "\nLa visita è prenotata. Porti con sé la tessera sanitaria e il numero della ricetta.")
+    morning = at.hour < 13
+    if english:
+        window = "between 8:00 and 13:00" if morning else "between 13:00 and 18:00"
+        return (f"\nYour visit is booked for {_BC_DAYS_EN[at.weekday()]} at {at:%H:%M}. "
+                f"Please arrive at the facility {window} that day and bring your health card and "
+                "your prescription number. If you cannot make it, write to us and we will look for another time.")
+    window = "tra le 8 e le 13" if morning else "tra le 13 e le 18"
+    return (f"\nLa visita è prenotata per {_BC_DAYS_IT[at.weekday()]} alle {at:%H:%M}. "
+            f"Si presenti in struttura {window} di quel giorno con la tessera sanitaria e il numero "
+            "della ricetta. Se non può venire ci scriva e cerchiamo un altro orario.")
 
 
 def _bc_offer_of_booking(chat: list[Message], partner: str, booking_id: str) -> str:
