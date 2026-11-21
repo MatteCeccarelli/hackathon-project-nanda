@@ -400,19 +400,23 @@ def _asst_of(doctor_id: str) -> str:
 
 def _speaks(doctor_id: str, lang: str, hint: str = "") -> bool:
     spec = _DOCTORS.get(doctor_id.rsplit("-", 1)[-1])
-    if spec is None:
-        return False
-    langs = spec[0]
-    if lang in langs:
+    if spec is not None:
+        langs = spec[0]
+        if lang in langs:
+            return True
+        if "*" in langs and lang not in {"it", "en"}:
+            rare = _RARE_BY_ASST.get(_asst_of(doctor_id))
+            if rare is not None and rare == lang:
+                return True
+            if hint and lang in hint.replace(",", "/").split("/"):
+                return True
+    if hint:
+        hint_langs = {l.strip() for l in hint.replace(",", "/").split("/") if l.strip()}
+        if lang in hint_langs:
+            return True
+    if lang == "it":
         return True
-    if "*" not in langs or lang in {"it", "en"}:
-        return False
-    # Lingua rara: vale solo se è quella dell'ASST del medico. Se l'ASST non è in tabella,
-    # ci si appoggia all'indicazione del partner (doctor_lang), che non viene mai inoltrata.
-    rare = _RARE_BY_ASST.get(_asst_of(doctor_id))
-    if rare is not None:
-        return rare == lang
-    return lang in hint.replace(",", "/").split("/")
+    return False
 
 
 def _is_urgent_reserve(slot: dict[str, str], at: datetime | None = None) -> bool:
@@ -921,13 +925,14 @@ class _Sent:
     citizen drop all offers, so ``again`` holds only what was re-sent for ``trigger``.
     """
 
-    __slots__ = ("offers", "trigger", "again", "retried")
+    __slots__ = ("offers", "trigger", "again", "retried", "waiting_list")
 
     def __init__(self) -> None:
         self.offers: set[str] = set()
         self.retried: set[str] = set()
         self.trigger = ""
         self.again: set[str] = set()
+        self.waiting_list = False
 
 
 # Every Ledger or citizen message opens its own turn, and turns of one need run at the same
@@ -978,7 +983,17 @@ async def _desk(
             and not _bc_offer_of_booking(chat, message.sender, fields_of(message.text).get("booking_id", ""))
         ):
             # cancel reason=no_availability request_id=...: il partner non ha posto.
-            # Nessuna offerta da ritirare: non si riapre la ricerca locale.
+            req_id = fields_of(message.text).get("request_id") or _bc_latest_request_id(chat, city.agent_id)
+            _LOG.info("care.partner.no_availability", extra={"partner": message.sender, "request_id": req_id})
+            status = _bc_partner_status([*chat, message], city.agent_id, req_id)
+            pending = [p for p, s in status.items() if s == "pending"]
+            citizen = _citizen(chat)
+            if status and not pending and citizen and _bc_open_partner_offers(chat, city.agent_id, citizen) == 0:
+                offer_id = f"wl-{message.need_id or req_id}"
+                if not _we(chat, city.agent_id, f"offer_id={offer_id}", to=citizen, word="offer"):
+                    note = _BC_WAITLIST_EN if _lang(chat) != "it" else _BC_WAITLIST_IT
+                    if await _say(city, citizen, f"offer offer_id={offer_id} waiting_list=true\n{note}"):
+                        _sent(message.need_id or req_id).waiting_list = True
             return
         if message.sender.startswith("citizen:"):
             if first_word(message.text) == "confirm":
@@ -1115,7 +1130,7 @@ async def _advance_alone(
     procedure = fixed or (None if reply is None else reply.get("procedure"))
     number = _number(chat)
     agenda = _ledger(chat, "agenda")
-    now = _when("" if agenda is None else agenda.get("agenda_now", ""))
+    now = _when_loose("" if agenda is None else agenda.get("agenda_now", ""))
     world = _latest_slots(chat)
     # Ask, then read the reply from history: the push of a ledger message does not open a turn.
     for _pass in range(3):
@@ -1169,7 +1184,7 @@ async def _advance_alone(
             # Regole in vigore (P1: ricette valide 2 giorni di agenda), lette una volta.
             await _say(city, LEDGER, "rules")
         agenda = _ledger(chat, "agenda")
-        now = _when("" if agenda is None else agenda.get("agenda_now", ""))
+        now = _when_loose("" if agenda is None else agenda.get("agenda_now", ""))
         world = _latest_slots(chat)
         if now is not None and (world is not None or retry):
             break
@@ -1270,8 +1285,22 @@ async def _advance_alone(
 
     # Solo dopo l'ultima pagina locale: si cercano gli agenti di altre ASST.
     if fixed is None:
-        if not retry and await _bc_waiting_list_fallback(city, message, chat, citizen, key):
-            return
+        prev_crits = _bc_sent_criteria(chat, city.agent_id)
+        days = _days_pref(chat)
+        days_str = "/".join(d for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun") if d in days) if days else ""
+        current_crit = (
+            procedure,
+            priority or "",
+            _lang(chat),
+            _gender(chat) or "",
+            days_str,
+        )
+        criteria_updated = bool(prev_crits and current_crit not in prev_crits)
+
+        if not retry and not criteria_updated:
+            if await _bc_waiting_list_fallback(city, message, chat, citizen, key, procedure, priority):
+                return
+
         await _bc_discover(city, message, chat, key, procedure, priority,
                            retry_offer=offer_id if retry else "")
 
@@ -1461,6 +1490,72 @@ def _bc_asked_partner(chat: list[Message], agent: str, partner: str, procedure: 
     )
 
 
+def _bc_extract_criteria(text: str) -> tuple[str, str, str, str, str]:
+    fields = fields_of(text)
+    return (
+        fields.get("procedure", ""),
+        fields.get("priority", ""),
+        fields.get("lang", "it"),
+        fields.get("gender_preference") or fields.get("gender", ""),
+        fields.get("days", ""),
+    )
+
+
+def _bc_sent_criteria(chat: list[Message], agent: str) -> list[tuple[str, str, str, str, str]]:
+    """Criteri distinti (procedure, priority, lang, gender, days) gia' inviati in need.request."""
+    seen: list[tuple[str, str, str, str, str]] = []
+    for row in chat:
+        if row.sender == agent and first_word(row.text) == "need.request":
+            c = _bc_extract_criteria(row.text)
+            if c not in seen:
+                seen.append(c)
+    return seen
+
+
+def _bc_latest_request_id(chat: list[Message], agent: str) -> str:
+    """request_id dell'ultimo need.request inviato a qualsiasi partner."""
+    for row in reversed(chat):
+        if row.sender == agent and first_word(row.text) == "need.request":
+            return fields_of(row.text).get("request_id", "")
+    return ""
+
+
+def _bc_partner_status(chat: list[Message], agent: str, req_id: str) -> dict[str, str]:
+    """Mappa partner_id -> 'pending' | 'no_availability' | 'offered' per il request_id specificato."""
+    status: dict[str, str] = {}
+    for i, row in enumerate(chat):
+        if row.sender == agent and first_word(row.text) == "need.request":
+            if fields_of(row.text).get("request_id") == req_id:
+                partner = row.recipient
+                if partner not in status:
+                    status[partner] = "pending"
+                for reply in chat[i + 1:]:
+                    if reply.sender == partner and reply.recipient == agent:
+                        w = words(reply.text)
+                        if _bc_offer_lines(reply.text):
+                            status[partner] = "offered"
+                            break
+                        elif "cancel" in w:
+                            status[partner] = "no_availability"
+                            break
+    return status
+
+
+def _bc_search_start_time(chat: list[Message], agent: str, req_id: str) -> datetime | None:
+    for row in chat:
+        if row.sender == agent and first_word(row.text) == "need.request":
+            if fields_of(row.text).get("request_id") == req_id:
+                if hasattr(row, "sent_at") and row.sent_at:
+                    return _when_loose(row.sent_at)
+    return None
+
+
+def _message_time(message: Message) -> datetime | None:
+    if hasattr(message, "sent_at") and message.sent_at:
+        return _when_loose(message.sent_at)
+    return None
+
+
 async def _bc_discover(
     city: City,
     message: Message,
@@ -1475,8 +1570,23 @@ async def _bc_discover(
     service = _BC_SERVICE_TYPES.get(procedure)
     if not service or priority in (None, "P") or not _number(chat):
         return
-    # Non aprire nuove ricerche se abbiamo gia' proposto uno slot valido.
-    if not retry_offer and (_offered(chat, city.agent_id) or _sent(key).offers):
+
+    lang = _lang(chat)
+    gender = _gender(chat)
+    days = _days_pref(chat)
+    days_str = "/".join(d for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun") if d in days) if days else ""
+    current_crit = (
+        procedure,
+        priority or "",
+        lang or "it",
+        gender or "",
+        days_str,
+    )
+    prev_crits = _bc_sent_criteria(chat, city.agent_id)
+    criteria_updated = bool(prev_crits and current_crit not in prev_crits)
+
+    # Non aprire nuove ricerche se abbiamo gia' proposto uno slot valido e i criteri non sono cambiati.
+    if not retry_offer and not criteria_updated and (_offered(chat, city.agent_id) or _sent(key).offers):
         return
     try:
         peers = await city.find(service)
@@ -1486,18 +1596,24 @@ async def _bc_discover(
     # Criteri di ricerca (non dati personali): lingua e genere preferiti aiutano il partner
     # a proporre il medico giusto invece di slot che il cittadino rifiuterebbe.
     criteria = ""
-    lang = _lang(chat)
     if lang and lang != "it":
         criteria += f" lang={lang}"
-    gender = _gender(chat)
     if gender:
         criteria += f" gender_preference={gender}"
-    days = _days_pref(chat)
-    if days:
-        criteria += " days=" + "/".join(d for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun") if d in days)
+    if days_str:
+        criteria += f" days={days_str}"
     district = _district(chat)
 
-    request_id = f"{key}.{retry_offer}" if retry_offer else key
+    rev = len(prev_crits) + 1 if criteria_updated else (len(prev_crits) or 1)
+    if retry_offer:
+        request_id = f"{key}.{retry_offer}"
+    elif criteria_updated:
+        request_id = f"{key}.{lang}" if (lang and lang != "it") else f"{key}.v{rev}"
+    elif lang and lang != "it" and not prev_crits:
+        request_id = f"{key}.{lang}"
+    else:
+        request_id = key
+
     contacted = 0
     # MACH-1.1: con una lingua rara si scrive PRIMA all'ASST che la parla, poi ai partner che
     # hanno pubblicato i loro id (fidati), infine agli altri trovati sull'Index.
@@ -1618,33 +1734,69 @@ _BC_WAITLIST_EN = (
 
 
 async def _bc_waiting_list_fallback(
-    city: City, message: Message, chat: list[Message], citizen: str, key: str
+    city: City,
+    message: Message,
+    chat: list[Message],
+    citizen: str,
+    key: str,
+    procedure: str,
+    priority: str | None,
 ) -> bool:
-    """Il cittadino torna a scrivere dopo l'avviso di ricerca e nessun partner ha proposto un
-    medico adatto: invece del silenzio (passivo, no_reply) riceve l'alternativa della lista
-    d'attesa, una sola volta."""
+    """Propone la lista d'attesa una sola volta quando:
+    - tutti i partner contattati hanno risposto senza disponibilita' o con offerte non valide;
+    - oppure scade la finestra di attesa limitata (2 minuti) per partner ancora pendenti.
+    Un messaggio del cittadino da solo non anticipa la lista d'attesa se la ricerca e' ancora pendente.
+    """
     agent = city.agent_id
     if message.sender != citizen:
         return False
-    asked = any(row.sender == agent and first_word(row.text) == "need.request" for row in chat)
-    note_at = max(
-        (i for i, row in enumerate(chat)
-         if row.sender == agent and row.text in (_BC_SEARCHING_IT, _BC_SEARCHING_EN)),
-        default=-1,
-    )
-    if not asked or note_at < 0:
-        return False
-    if not any(row.msg_id == message.msg_id for row in chat[note_at + 1:]):
-        return False  # il messaggio del cittadino non e' successivo all'avviso
     if _bc_open_partner_offers(chat, agent, citizen) > 0:
         return False
     offer_id = f"wl-{message.need_id or key}"
     if _we(chat, agent, f"offer_id={offer_id}", to=citizen, word="offer"):
         return False
+    if _offered(chat, agent) or _sent(key).offers:
+        return False
+
+    req_id = _bc_latest_request_id(chat, agent)
+    if not req_id:
+        return False
+
+    # Se i criteri sono aggiornati, la ricerca va riaperta invece di proporre la lista d'attesa
+    prev_crits = _bc_sent_criteria(chat, agent)
+    days = _days_pref(chat)
+    days_str = "/".join(d for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun") if d in days) if days else ""
+    current_crit = (
+        procedure,
+        priority or "",
+        _lang(chat),
+        _gender(chat) or "",
+        days_str,
+    )
+    if prev_crits and current_crit not in prev_crits:
+        return False
+
+    status = _bc_partner_status(chat, agent, req_id)
+    if not status:
+        return False
+
+    pending = [p for p, s in status.items() if s == "pending"]
+    if pending:
+        # Finestra di attesa limitata compatibile con il percorso (120 s)
+        t_start = _bc_search_start_time(chat, agent, req_id)
+        t_now = _message_time(message)
+        if t_start and t_now:
+            elapsed = (t_now - t_start).total_seconds()
+            if elapsed < 120:
+                return False
+        else:
+            return False
+
     note = _BC_WAITLIST_EN if _lang(chat) != "it" else _BC_WAITLIST_IT
     if await _say(city, citizen, f"offer offer_id={offer_id} waiting_list=true\n{note}"):
-        _sent(key).offers.add(offer_id)
-    return True
+        _sent(key).waiting_list = True
+        return True
+    return False
 
 
 _BC_SEARCHING_IT = (
@@ -1985,14 +2137,17 @@ def _bc_open_partner_offers(chat: list[Message], agent: str, citizen: str) -> in
 def _bc_offer_pending(
     chat: list[Message], agent: str, citizen: str, sent_offers: set[str]
 ) -> bool:
-    """True se c'e' gia' un'offerta attiva proposta al cittadino e non ancora confermata/annullata."""
-    if sent_offers and not any(row.sender == citizen and "cancel" in words(row.text) for row in chat):
+    """True se c'e' gia' un'offerta di slot attiva proposta al cittadino e non ancora confermata/annullata."""
+    real_sent = {s for s in sent_offers if not s.startswith("wl-")}
+    if real_sent and not any(row.sender == citizen and "cancel" in words(row.text) for row in chat):
         return True
     for row in reversed(chat):
         if row.sender == citizen:
             return False
-        if row.sender == agent and row.recipient == citizen and "offer" in words(row.text):
-            return True
+        if row.sender == agent and row.recipient == citizen:
+            lines = _bc_offer_lines(row.text)
+            if any(info.get("slot_id") for info in lines):
+                return True
     return False
 
 
@@ -2042,21 +2197,31 @@ def _bc_partner_offer_line(
 ) -> tuple[datetime, str, str] | None:
     """Una riga ``offer`` di un partner, validata; ``None`` se va scartata."""
     procedure = info.get("procedure", "")
+    offer_id = info.get("offer_id", "")
+    slot_id = info.get("slot_id", "")
+    doctor_id = info.get("doctor_id", "")
+    facility = info.get("facility") or message.sender
+
     if not _bc_asked_partner(chat, city.agent_id, message.sender, procedure):
+        _LOG.info("care.partner.discarded", extra={"reason": "partner_not_asked", "partner": message.sender, "procedure": procedure})
         return None
     rx = _rx_reply(chat)
     agenda = _ledger(chat, "agenda")
     citizen = _citizen(chat)
-    now = _when((agenda or {}).get("agenda_now", ""))
+    now = _when_loose((agenda or {}).get("agenda_now", ""))
     at_text = info.get("agenda_date") or info.get("at", "")
     at = _when_loose(at_text)
     if not rx or not citizen or not now or not at:
+        _LOG.info("care.partner.discarded", extra={"reason": "missing_context", "offer_id": offer_id, "has_rx": bool(rx), "has_citizen": bool(citizen), "has_now": bool(now), "has_at": bool(at)})
         return None
     if rx.get("procedure") != procedure or rx.get("state", "issued") != "issued":
+        _LOG.info("care.partner.discarded", extra={"reason": "rx_mismatch_or_state", "offer_id": offer_id, "rx_proc": rx.get("procedure"), "offer_proc": procedure, "rx_state": rx.get("state")})
         return None
-    if info.get("facility") != message.sender:
+    if info.get("facility") and info["facility"] != message.sender:
+        _LOG.info("care.partner.discarded", extra={"reason": "facility_mismatch", "offer_id": offer_id, "facility": info.get("facility"), "sender": message.sender})
         return None
-    if any(not info.get(field) for field in ("offer_id", "slot_id", "doctor_id")):
+    if not offer_id or not slot_id or not doctor_id:
+        _LOG.info("care.partner.discarded", extra={"reason": "missing_required_fields", "offer_id": offer_id, "slot_id": slot_id, "doctor_id": doctor_id})
         return None
     # agenda_day ed expiry sono facoltativi nel formato comune: si ricavano dalla data.
     day = info.get("agenda_day") or _WEEKDAYS[at.weekday()]
@@ -2065,38 +2230,47 @@ def _bc_partner_offer_line(
     priority = rx.get("priority", "")
     lead = timedelta(minutes=15) if priority == "U" else _LEAD
     if at <= now + lead:
+        _LOG.info("care.partner.discarded", extra={"reason": "slot_in_lead_or_past", "offer_id": offer_id, "at": at_text, "now": now.isoformat()})
         return None
     if priority == "U" and at.date() != now.date():
+        _LOG.info("care.partner.discarded", extra={"reason": "priority_u_not_today", "offer_id": offer_id, "at": at_text, "now": now.isoformat()})
         return None
     if priority in _DEADLINE_DAYS and at >= now + timedelta(days=_DEADLINE_DAYS[priority]):
+        _LOG.info("care.partner.discarded", extra={"reason": "priority_deadline_exceeded", "offer_id": offer_id, "at": at_text, "priority": priority})
         return None
     if _is_urgent_reserve(info, at) and priority != "U":
+        _LOG.info("care.partner.discarded", extra={"reason": "urgent_reserve_non_u", "offer_id": offer_id, "slot_id": slot_id})
         return None
     if info.get("free", "1") == "0":
+        _LOG.info("care.partner.discarded", extra={"reason": "slot_not_free", "offer_id": offer_id})
         return None
     expiry = _when_loose(expiry_text)
     if expiry is None or expiry <= now:
+        _LOG.info("care.partner.discarded", extra={"reason": "offer_expired", "offer_id": offer_id, "expiry": expiry_text})
         return None
     # MACH-1.2: offerta "rilassata" (rompe un vincolo). La carrozzina non si rilassa.
     relaxed = info.get("relaxed", "").lower()
     if relaxed == "wheelchair":
+        _LOG.info("care.partner.discarded", extra={"reason": "wheelchair_cannot_relax", "offer_id": offer_id})
         return None
 
     # Mai inoltrare un medico che non parla la lingua del cittadino (o del genere sbagliato):
     # il cittadino lo rifiuterebbe e il percorso resterebbe aperto. doctor_lang del partner
     # serve solo come indizio per le lingue rare e non viene mai scritto al cittadino.
-    if not _bc_fits_citizen(chat, info["doctor_id"], info.get("doctor_lang", "")):
+    if not _bc_fits_citizen(chat, doctor_id, info.get("doctor_lang", "")):
+        _LOG.info("care.partner.discarded", extra={"reason": "doctor_not_fitting", "offer_id": offer_id, "doctor_id": doctor_id, "lang": _lang(chat)})
         return None
 
-    offer_id = info["offer_id"]
     if _our_offer(chat, city.agent_id, offer_id):
+        _LOG.info("care.partner.discarded", extra={"reason": "offer_already_made", "offer_id": offer_id})
         return None
-    if _we(chat, city.agent_id, f"slot_id={info['slot_id']}", to=citizen, word="offer"):
+    if _we(chat, city.agent_id, f"slot_id={slot_id}", to=citizen, word="offer"):
+        _LOG.info("care.partner.discarded", extra={"reason": "slot_already_offered", "slot_id": slot_id})
         return None
 
     fields = [
-        "offer", f"offer_id={offer_id}", f"slot_id={info['slot_id']}",
-        f"doctor_id={info['doctor_id']}", f"facility={message.sender}",
+        "offer", f"offer_id={offer_id}", f"slot_id={slot_id}",
+        f"doctor_id={doctor_id}", f"facility={facility}",
         f"procedure={procedure}", f"agenda_date={at.isoformat()}",
         f"agenda_day={day}", f"expiry={expiry.isoformat()}",
         f"priority={priority}",
