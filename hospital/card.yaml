@@ -1,7 +1,7 @@
 agent_id: agent:vs1bs4485dcn
 team: team:t-5-gin-tokens
 name: hospital
-version: 1.0.6
+version: 1.0.7
 cap_versions:
   - "1.0"
 profiles:
