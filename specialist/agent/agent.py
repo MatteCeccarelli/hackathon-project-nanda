@@ -98,7 +98,13 @@ async def main(need: Need, city: City) -> None:
         # Kit E19: con need.is_emergency si segnala l'emergenza e ci si ferma (-2 se manca).
         await city.say(message.sender, "escalate.emergency reason=red_flag")
         return
-    case = await city.history(need_id=message.need_id)
+    if message.need_id is None and not message.text and not message.sender.startswith("citizen:"):
+        # Senza caso e senza testo (need.request strutturata, es. la conformance) nessun ramo
+        # di handle() usa la storia: si evita la lettura dell'intera casella (5 pagine dal Relay),
+        # che ritarda il renew oltre i 5 s attesi dalla conformance.
+        case = [message]
+    else:
+        case = await city.history(need_id=message.need_id)
     await handle(role, city, message, case)
 
 
@@ -1747,6 +1753,10 @@ async def _facility(
         await _on_reported(city, message, chat)
     elif "checkin" in kind and message.sender.startswith("citizen:"):
         await _on_checkin(city, message, chat, reports=reports)
+    elif reports and message.sender.startswith("citizen:") and _report_pending(chat, city.agent_id):
+        # Risposta alla richiesta di consenso al referto: con consent_ref si condivide, un no
+        # in parole semplici (nessun consent_ref) archivia il referto senza condividerlo.
+        await _finish_report(city, message, chat, fields_of(message.text).get("consent_ref", ""))
     elif "confirm" in kind:
         await _on_confirm(city, message, chat, hold_self=hold_self)
 
@@ -2024,11 +2034,86 @@ async def _on_checked_in(
     if not booking_id:
         return
     token = f"booking_id={booking_id}"
-    if reports and not _we(chat, city.agent_id, token, to=LEDGER, word="report"):
-        await _say(city, LEDGER, f"report booking_id={booking_id} outcome_code=VISIT")
     if citizen and not _we(chat, city.agent_id, token, to=citizen, word="checkin"):
         await _say(city, citizen, f"checkin booking_id={booking_id}")
     if not reports:
+        return
+    if not citizen:
+        # Senza cittadino non si puo' chiedere il consenso: referto archiviato senza condivisione.
+        await _finish_report(city, message, chat, "", booking_id=booking_id)
+        return
+    # Kit E19: dopo il check-in lo specialista chiede il consenso con scopo report_sharing e
+    # archivia il referto con il consent_ref restituito (turno della risposta del cittadino).
+    if not any(row.sender == city.agent_id and "purpose=report_sharing" in row.text.split() for row in chat):
+        await _say(city, citizen, _REPORT_ASK)
+
+
+_REPORT_ASK = "consent purpose=report_sharing Posso condividere il suo referto con il suo medico di base?"
+
+
+def _report_booking(chat: list[Message], agent: str) -> str:
+    """booking_id del check-in registrato (ultimo checkin nostro al cittadino o checked_in)."""
+    for row in reversed(chat):
+        head = first_word(row.text)
+        if (row.sender == agent and head == "checkin") or (row.sender == LEDGER and head == "checked_in"):
+            booking_id = fields_of(row.text).get("booking_id", "")
+            if booking_id:
+                return booking_id
+    return ""
+
+
+def _report_pending(chat: list[Message], agent: str) -> bool:
+    """Consenso al referto chiesto e referto non ancora mandato al Ledger."""
+    asked = any(row.sender == agent and "purpose=report_sharing" in row.text.split() for row in chat)
+    return asked and not any(
+        row.sender == agent and row.recipient == LEDGER and first_word(row.text) == "report" for row in chat
+    )
+
+
+def _visit_is_control(chat: list[Message], booking_id: str) -> bool:
+    """La visita prenotata e' gia' un controllo (CTRL-CARD): niente altra ricetta di controllo."""
+    slot = ""
+    for row in chat:
+        fields = fields_of(row.text)
+        if booking_id and (fields.get("booking_id") == booking_id or fields.get("hold_id") == booking_id):
+            slot = fields.get("slot_id", "") or slot
+    for row in chat:
+        for line in row.text.splitlines():
+            fields = fields_of(line)
+            if slot and fields.get("slot_id") == slot and fields.get("procedure"):
+                return fields["procedure"] == "CTRL-CARD"
+    return any("procedure=CTRL-CARD" in row.text.split() for row in chat)
+
+
+async def _finish_report(
+    city: City, message: Message, chat: list[Message], consent_ref: str, *, booking_id: str = ""
+) -> None:
+    agent = city.agent_id
+    booking_id = booking_id or _report_booking(chat, agent)
+    citizen = _citizen(chat)
+    if not booking_id:
+        return
+    token = f"booking_id={booking_id}"
+    if any(row.sender == agent and row.recipient == LEDGER and first_word(row.text) == "report"
+           and token in row.text.split() for row in chat):
+        return
+    follow_up = ""
+    if citizen and not _visit_is_control(chat, booking_id):
+        # Percorso cardiologico: la visita apre il controllo periodico (CTRL-CARD, priorita' P),
+        # emesso sul Ledger prima del referto che lo cita.
+        follow_up = _rx(None, f"fu-{booking_id}")
+        if not _we(chat, agent, f"prescription_number={follow_up}", to=LEDGER, word="prescribe"):
+            await _say(
+                city, LEDGER,
+                f"prescribe patient={citizen} procedure=CTRL-CARD priority=P symptom_code=SYM-FOLLOWUP "
+                f"prescription_number={follow_up} follow_up_of={booking_id}",
+            )
+    parts = ["report", token, "outcome_code=VISIT"]
+    if consent_ref:
+        parts.append(f"consent_ref={consent_ref}")
+    if follow_up:
+        parts.append(f"follow_up_prescription_number={follow_up}")
+    if not await _say(city, LEDGER, " ".join(parts)):
         return
     found = await _await_line(city, message.need_id, chat, "reported", token, op="report")
     if found is None:
@@ -2036,10 +2121,12 @@ async def _on_checked_in(
         return
     reply, fresh = found
     if first_word(reply.text) == "reported":
-        await _on_reported(city, reply, fresh)
+        await _on_reported(city, reply, fresh, follow_up=follow_up)
 
 
-async def _on_reported(city: City, message: Message, chat: list[Message]) -> None:
+async def _on_reported(
+    city: City, message: Message, chat: list[Message], *, follow_up: str = ""
+) -> None:
     booking_id = fields_of(message.text).get("booking_id", "")
     citizen = _citizen(chat)
     if not booking_id or not citizen:
@@ -2047,4 +2134,22 @@ async def _on_reported(city: City, message: Message, chat: list[Message]) -> Non
     token = f"booking_id={booking_id}"
     if _we(chat, city.agent_id, token, to=citizen, word="report"):
         return
-    await _say(city, citizen, f"report booking_id={booking_id} outcome_code=VISIT")
+    follow_up = follow_up or fields_of(message.text).get("follow_up_prescription_number", "")
+    if not follow_up:
+        for row in reversed(chat):
+            if row.sender == city.agent_id and f"follow_up_of={booking_id}" in row.text.split():
+                follow_up = fields_of(row.text).get("prescription_number", "")
+                break
+    lines = [f"report booking_id={booking_id} outcome_code=VISIT"]
+    if follow_up:
+        lines[0] += f" follow_up_prescription_number={follow_up}"
+        lines.append(
+            f"prescription prescription_number={follow_up} procedure=CTRL-CARD priority=P follow_up_of={booking_id}"
+        )
+        lines.append(
+            "Il referto della visita e' archiviato. Le ho preparato la ricetta per il controllo "
+            "periodico, senza urgenza: puo' prenotarlo con calma dal Centro Prenotazioni."
+        )
+    else:
+        lines.append("Il referto della visita e' archiviato. Grazie per essere venuto.")
+    await _say(city, citizen, "\n".join(lines))
