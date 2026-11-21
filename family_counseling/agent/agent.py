@@ -891,6 +891,22 @@ async def _advance_alone(
             await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}")
         return
 
+    if fixed and not chosen:
+        offer_id = f"wl-{message.need_id or message.msg_id}"
+        token = f"offer_id={offer_id}"
+        if offer_id not in sent.offers and not _we(chat, agent, token, to=citizen, word="offer"):
+            lang = _lang(chat)
+            courtesy = (
+                "Currently all appointment slots for family counseling are fully booked. "
+                "To ensure your care, I have placed your request on our priority waiting list."
+                if lang == "en"
+                else "Al momento tutti i posti disponibili per il consultorio familiare sono esauriti. "
+                "Per garantire la presa in carico, ho registrato la sua richiesta nella nostra lista d'attesa prioritaria."
+            )
+            if await _say(city, citizen, f"offer offer_id={offer_id} waiting_list=true\n{courtesy}"):
+                sent.offers.add(offer_id)
+        return
+
     # Solo dopo l'ultima pagina locale: si cercano gli agenti di altre ASST.
     if fixed is None:
         await _bc_discover(city, message, chat, key, procedure, priority)
