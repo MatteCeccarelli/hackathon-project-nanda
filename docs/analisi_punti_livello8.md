@@ -39,3 +39,14 @@ Tutto parte dalla prenotazione. Un caso non risolto riparte dopo 15 min e viene 
 2. Specialista: consenso, referto, ricetta di controllo.
 3. Messaggi più utili per i +1 di revisione (niente clinico).
 4. Risposte più rapide alle altre ASST.
+
+## Avanzamento (sab ~11:50)
+
+| # | Fatto | Stato |
+|---|---|---|
+| 1 | Booking 1.0.13 in gara (10:29 UTC); audit dopo il deploy in corso | in gara |
+| 3 | Specialista: consenso `report_sharing` → referto con `consent_ref` → ricetta CTRL-CARD P `follow_up_of=` (8/8 test) | in main, da deployare |
+| 5 | Ricevuta del booking con giorno, ora, mezza giornata e cosa portare | in main, da deployare |
+| — | Fix della casella (`main()`) portato a gp, consultorio, ospedale, specialista: evita il blocco dei controlli al prossimo deploy | in main, da deployare |
+| 6 | Risposte più rapide alle altre ASST | da fare |
+
