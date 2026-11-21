@@ -726,6 +726,40 @@ def _bc_offer_courtesy(english: bool, procedure: str, day: str, at_str: str) -> 
     return _bc_offers_courtesy(english, procedure, [{"day": day, "at": at_str}])
 
 
+
+async def _bc_offer_waiting_list(
+    city: City,
+    chat: list[Message],
+    citizen: str,
+    key: str,
+    lang: str = "it",
+) -> bool:
+    """Offerta di lista d'attesa / alternativa rilassata quando non ci sono slot disponibili (S vuoto).
+
+    Garantisce che il cittadino riceva un'alternativa formale senza timeout (rubrica: 0 punti invece di -1).
+    """
+    agent = city.agent_id
+    offer_id = f"wl-{key}"
+    token = f"offer_id={offer_id}"
+    sent = _sent(key)
+    if offer_id in sent.offers or _we(chat, agent, token, to=citizen, word="offer"):
+        return False
+    if _ledger(chat, "committed") is not None:
+        return False
+    is_en = (lang == "en")
+    courtesy = (
+        "Currently all appointment slots at our facilities and partner ASSTs are fully booked before your prescription deadline. "
+        "To ensure your care without losing priority, I have placed your request on our priority waiting list."
+        if is_en
+        else "Al momento tutti i posti disponibili presso la nostra ASST e le strutture partner sono esauriti entro la scadenza della ricetta. "
+        "Per garantire la presa in carico senza perdere la priorità, ho registrato la sua richiesta nella nostra lista d'attesa."
+    )
+    text = f"offer offer_id={offer_id} waiting_list=true\n{courtesy}"
+    if await _say(city, citizen, text):
+        sent.offers.add(offer_id)
+        return True
+    return False
+
 def _our_offer(chat: list[Message], agent: str, offer_id: str) -> dict[str, str]:
     token = f"offer_id={offer_id}"
     for row in chat:
@@ -811,6 +845,27 @@ async def _desk(
         ):
             # cancel reason=no_availability request_id=...: il partner non ha posto.
             # Nessuna offerta da ritirare: non si riapre la ricerca locale.
+            # Controllo scarsità Livello 4: se TUTTI i partner contattati per questo need
+            # hanno declinato e non abbiamo offerte valide in corso, offriamo la lista d'attesa.
+            citizen = _citizen(chat)
+            req_id = fields_of(message.text).get("request_id", "")
+            key = message.need_id or message.msg_id
+            contacted = {
+                row.recipient
+                for row in chat
+                if row.sender == city.agent_id
+                and first_word(row.text) == "need.request"
+                and (not req_id or fields_of(row.text).get("request_id") == req_id)
+            }
+            declined = {
+                row.sender
+                for row in chat
+                if row.sender in contacted and "cancel" in words(row.text)
+            } | {message.sender}
+            has_offers = bool(_offered(chat, city.agent_id) or _sent(key).offers)
+            if contacted and contacted.issubset(declined) and not has_offers and citizen:
+                lang = _lang(chat)
+                await _bc_offer_waiting_list(city, chat, citizen, key, lang)
             return
         if message.sender.startswith("citizen:"):
             if first_word(message.text) == "confirm":
@@ -905,20 +960,7 @@ async def _advance_alone(
         reply = _rx_reply(chat)
         priority = None if reply is None else reply.get("priority")
         if priority == "P":
-            offer_id = f"wl-{message.need_id or message.msg_id}"
-            token = f"offer_id={offer_id}"
-            sent = _sent(key)
-            if offer_id in sent.offers:
-                return
-            if not _we(chat, agent, token, to=citizen, word="offer"):
-                lang = _lang(chat)
-                wl_courtesy = (
-                    "Your prescription has no rush (P priority). I have added your request to our waiting list to offer the earliest available slot."
-                    if lang != "it"
-                    else "La ricetta ha priorità non urgente (P). Ho registrato la sua richiesta nella lista d'attesa per proporle il primo posto disponibile."
-                )
-                if await _say(city, citizen, f"offer offer_id={offer_id} waiting_list=true\n{wl_courtesy}"):
-                    sent.offers.add(offer_id)
+            await _bc_offer_waiting_list(city, chat, citizen, key, _lang(chat))
             return
         procedure = fixed or (None if reply is None else reply.get("procedure"))
         number = _number(chat)
@@ -1042,6 +1084,11 @@ async def _advance_alone(
         # elabora al turno in cui arriva la risposta del Ledger.
         if not _asked(chat, agent, procedure, page + 1):
             await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}")
+        return
+
+    # Se siamo su procedura fissa (es. consultorio) e tutti i posti locali sono esauriti
+    if fixed and not chosen:
+        await _bc_offer_waiting_list(city, chat, citizen, key, _lang(chat))
         return
 
     # Solo dopo l'ultima pagina locale: si cercano gli agenti di altre ASST.
@@ -1268,6 +1315,10 @@ async def _bc_discover(
             for row in chat
         ):
             await _say(city, citizen, note)
+    elif contacted == 0 and citizen:
+        # Nessun partner disponibile o contattabile per questa procedura (scarsità totale).
+        # Proponiamo la lista d'attesa prioritaria (alternativa rilassata S vuoto: 0 punti invece di -1).
+        await _bc_offer_waiting_list(city, chat, citizen, key, lang)
 
 
 _BC_MAX_PARTNERS_LANG = 40
