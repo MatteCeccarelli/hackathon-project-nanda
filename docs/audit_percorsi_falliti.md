@@ -67,6 +67,16 @@ Restano: P0 deploy di main (F1), domande agli organizzatori (F2).
 
 Test: compilazione, card valida, offerta di lista d'attesa provata con un finto `say` (una sola volta anche se richiamata). Non testabile in locale: ricerca esaurita con il Ledger reale.
 
+### 🧪 Test locali prima del deploy (città finta con Ledger scriptato)
+
+| Agente | Nuovo | Pre-fix (25bb418) | Note |
+|---|---|---|---|
+| booking | **11/11** | 6/11 | Pre-fix riproduce il ciclo: **60 richieste al Ledger in 30 turni** dopo le offerte; nuovo: 0. Confirm lontano senza giro di agenda; percorso fermo 25 min ignorato; ricerca esaurita → lista d'attesa |
+| consultorio | 6/6 | 6/6 | Il ciclo non lo riguardava (non rilegge l'agenda); guadagno solo sui percorsi fermi |
+| gp, ospedale, specialista | ok | — | `city run`: ricetta, emergenza, check-in senza errori; 5/5 card valide |
+
+Non testabile in locale: coda e carico reali, più copie in parallelo, orologio dell'agenda della città.
+
 ## ⚠️ Emergenza (03:36 UTC / 04:36 CET)
 
 **Il centro prenotazioni non risponde dalle 02:46 UTC (03:46 CET).**
