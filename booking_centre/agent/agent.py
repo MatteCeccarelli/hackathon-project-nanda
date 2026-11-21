@@ -1398,8 +1398,10 @@ async def _advance_alone(
     if fixed is None:
         if not retry and await _bc_waiting_list_fallback(city, message, chat, citizen, key):
             return
-        await _bc_discover(city, message, chat, key, procedure, priority,
-                           retry_offer=offer_id if retry else "")
+        contacted = await _bc_discover(city, message, chat, key, procedure, priority,
+                                       retry_offer=offer_id if retry else "")
+        if contacted == 0 and priority not in (None, "P"):
+            await _bc_waiting_list_last(city, message, chat, citizen, key)
 
 
 async def _on_confirm(
@@ -1632,18 +1634,19 @@ async def _bc_discover(
     priority: str | None,
     *,
     retry_offer: str = "",
-) -> None:
-    """Fallback dopo l'esaurimento del catalogo locale, senza trasmettere dati del cittadino."""
+) -> int:
+    """Fallback dopo l'esaurimento del catalogo locale, senza trasmettere dati del cittadino.
+    Restituisce quante strutture di altre ASST sono state interrogate ora."""
     service = _BC_SERVICE_TYPES.get(procedure)
     if not service or priority in (None, "P") or not _number(chat):
-        return
+        return 0
     # Non aprire nuove ricerche se abbiamo gia' proposto uno slot valido.
     if not retry_offer and (_offered(chat, city.agent_id) or _sent(key).offers):
-        return
+        return -1
     try:
         peers = await city.find(service)
     except CapError:
-        return
+        return 0
 
     # Criteri di ricerca (non dati personali): lingua e genere preferiti aiutano il partner
     # a proporre il medico giusto invece di slot che il cittadino rifiuterebbe.
@@ -1705,6 +1708,21 @@ async def _bc_discover(
             for row in chat
         ):
             await _say(city, citizen, note)
+    return contacted
+
+
+async def _bc_waiting_list_last(city: City, message: Message, chat: list[Message], citizen: str, key: str) -> None:
+    """Audit 2 (G3): nessun posto locale adatto e nessuna altra ASST da interrogare. Invece del
+    silenzio (no_booking -1) il cittadino riceve l'alternativa della lista d'attesa
+    (empty_set_alternative, 0), una sola volta."""
+    offer_id = f"wl-{message.need_id or key}"
+    sent = _sent(key)
+    if offer_id in sent.offers or _we(chat, city.agent_id, f"offer_id={offer_id}", to=citizen, word="offer"):
+        return
+    note = _BC_WAITLIST_EN if _lang(chat) != "it" else _BC_WAITLIST_IT
+    if await _say(city, citizen, f"offer offer_id={offer_id} waiting_list=true\n{note}"):
+        sent.offers.add(offer_id)
+        _LOG.info("care.waitlist.last", extra={"need_id": (message.need_id or "")[:48]})
 
 
 _BC_MAX_PARTNERS_LANG = 40
