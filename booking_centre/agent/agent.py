@@ -86,8 +86,17 @@ async def main(need: Need, city: City) -> None:
     text = message.text or need.summary
     if clinical(text):
         raise OutOfScope()
+    role = role_of()
+    if (
+        role == "gp"
+        and message.sender.startswith("citizen:")
+        and (need.is_emergency or message.body.get("is_emergency") is True)
+    ):
+        # Kit E19: con need.is_emergency si segnala l'emergenza e ci si ferma (-2 se manca).
+        await city.say(message.sender, "escalate.emergency reason=red_flag")
+        return
     case = await city.history(need_id=message.need_id)
-    await handle(role_of(), city, message, case)
+    await handle(role, city, message, case)
 
 
 def _asks_address(message: Message) -> bool:
@@ -492,7 +501,7 @@ def fitting(
 
 
 def _emergency(message: Message) -> bool:
-    if understood(message).body.get("is_emergency") is True:
+    if understood(message).body.get("is_emergency") is True or message.body.get("is_emergency") is True:
         return True
     lowered = message.text.lower()
     return any(flag in lowered for flag in _RED_FLAGS)
@@ -991,6 +1000,9 @@ async def _desk(
     if "confirm" in kind and (
         message.sender.startswith("citizen:") or message.sender.startswith("agent:")
     ):
+        if fixed is None and not hold_self and message.sender.startswith("citizen:"):
+            if await _bc_confirm_past(city, message, chat):
+                return
         await _on_confirm(city, message, chat, hold_self=hold_self)
         return
     if "booking.receipt" in kind and message.sender.startswith("agent:"):
@@ -1051,6 +1063,71 @@ def _late_page(chat: list[Message], agent: str, page: int) -> Message | None:
         if row.sender == LEDGER and first_word(row.text) == "slots" and _page(row.text)[0] == page:
             return row
     return None
+
+
+_FRESH_SECONDS = 30
+
+
+def _age_seconds(row: Message) -> float:
+    """Secondi reali da quando la riga è stata scritta; 0 se l'ora non è leggibile."""
+    sent = getattr(row, "sent_at", "") or ""
+    try:
+        when = datetime.fromisoformat(str(sent).replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if when.tzinfo is None:
+        return 0.0
+    return (datetime.now(when.tzinfo) - when).total_seconds()
+
+
+def _latest_ledger_row(chat: list[Message], head: str) -> Message | None:
+    found: Message | None = None
+    for row in chat:
+        if row.sender == LEDGER and first_word(row.text) == head:
+            found = row
+    return found
+
+
+async def _bc_fresh_clock(
+    city: City,
+    message: Message,
+    chat: list[Message],
+    procedure: str | None,
+    now: datetime,
+    world: str | None,
+    retry: bool,
+) -> tuple[list[Message], datetime, str | None]:
+    """Se l'agenda letta è vecchia (rielaborazione dopo un timeout del server, l'agenda corre
+    60 volte più veloce) si rilegge agenda e, se serve, la prima pagina del catalogo."""
+    agenda_row = _latest_ledger_row(chat, "agenda")
+    if agenda_row is None or _age_seconds(agenda_row) <= _FRESH_SECONDS:
+        return chat, now, world
+    seen = {row.msg_id for row in chat}
+    if not await _say(city, LEDGER, "agenda"):
+        return chat, now, world
+    slots_row = _latest_ledger_row(chat, "slots")
+    stale_world = (
+        not retry and procedure is not None and world is not None and slots_row is not None
+        and _age_seconds(slots_row) > _FRESH_SECONDS
+    )
+    if stale_world:
+        await _say(city, LEDGER, f"world procedure={procedure} page=1")
+
+    def ready(rows: list[Message]) -> bool:
+        new = [r for r in rows if r.msg_id not in seen and r.sender == LEDGER]
+        has_agenda = any(first_word(r.text) == "agenda" for r in new)
+        has_world = not stale_world or any(
+            first_word(r.text) == "slots" and _page(r.text)[0] == 1 for r in new
+        )
+        return has_agenda and has_world
+
+    chat = await _until(city, message.need_id, chat, ready)
+    agenda = _ledger(chat, "agenda")
+    fresh = _when("" if agenda is None else agenda.get("agenda_now", "")) or now
+    if stale_world:
+        world = _latest_slots(chat) or world
+    _LOG.info("care.clock.refresh", extra={"stale_world": stale_world})
+    return chat, fresh, world
 
 
 async def _advance(
@@ -1187,6 +1264,8 @@ async def _advance_alone(
         )
     else:
         return
+    if now is not None:
+        chat, now, world = await _bc_fresh_clock(city, message, chat, procedure, now, world, retry)
     if now is None or (world is None and not retry):
         return
     if fixed is None and _rx_expired(chat, _rx_reply(chat), now):
@@ -1371,6 +1450,34 @@ def _bc_offer_of_booking(chat: list[Message], partner: str, booking_id: str) -> 
         if row.recipient == partner and "confirm" in words(row.text):
             return fields_of(row.text).get("offer_id", "")
     return ""
+
+
+async def _bc_confirm_past(city: City, message: Message, chat: list[Message]) -> bool:
+    """Conferma arrivata quando il posto è ormai passato (cittadini lenti, agenda 60x):
+    invece del silenzio si annulla con reason=expired e si propongono posti nuovi."""
+    agent = city.agent_id
+    offer_id = fields_of(message.text).get("offer_id", "")
+    offer = _our_offer(chat, agent, offer_id) if offer_id else {}
+    at = _when(offer.get("agenda_date", "")) if offer else None
+    if at is None or offer_id.startswith("wl-"):
+        return False
+    seen = {row.msg_id for row in chat}
+    if not await _say(city, LEDGER, "agenda"):
+        return False
+    chat = await _until(
+        city, message.need_id, chat,
+        lambda rows: any(r.msg_id not in seen and r.sender == LEDGER and first_word(r.text) == "agenda" for r in rows),
+    )
+    agenda = _ledger(chat, "agenda")
+    now = _when("" if agenda is None else agenda.get("agenda_now", ""))
+    if now is None or at > now + timedelta(minutes=15):
+        return False
+    citizen = message.sender
+    if not _we(chat, agent, f"offer_id={offer_id}", to=citizen, word="cancel"):
+        await _say(city, citizen, f"cancel offer_id={offer_id} reason=expired")
+    _LOG.info("care.confirm.past", extra={"offer_id": offer_id[:48]})
+    await _advance(city, message, chat, fixed=None, replacing=True)
+    return True
 
 
 async def _partner_cancel(
@@ -1626,6 +1733,9 @@ async def _bc_waiting_list_fallback(
     agent = city.agent_id
     if message.sender != citizen:
         return False
+    first = next((row for row in chat if row.sender == citizen and row.recipient == agent), None)
+    if first is not None and first.msg_id == message.msg_id:
+        return False  # e' la prima richiesta (anche se rielaborata dopo un timeout)
     asked = any(row.sender == agent and first_word(row.text) == "need.request" for row in chat)
     note_at = max(
         (i for i, row in enumerate(chat)
@@ -2484,6 +2594,18 @@ async def _on_refused(
             slot = fields_of(row.text).get("slot_id", slot)
     if not slot:
         return
+    if "EXPIRED" in message.text:
+        holds = [
+            row for row in chat
+            if row.sender == agent and row.recipient == LEDGER and first_word(row.text) == "hold"
+            and f"slot_id={slot}" in row.text.split()
+        ]
+        if len(holds) == 1:
+            # Il posto non e' stato preso da altri: la presa e' scaduta prima del commit.
+            _LOG.info("care.hold.retry", extra={"slot": slot[:48]})
+            if await _say(city, LEDGER, holds[-1].text):
+                await _finish_booking(city, message, chat, slot, hold_self=hold_self)
+            return
     target, _, _ = _booking_of(chat, agent, slot)
     offer_id = ""
     for row in chat:
