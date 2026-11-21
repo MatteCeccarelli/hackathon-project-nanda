@@ -920,7 +920,7 @@ async def _on_confirm(
     agent = city.agent_id
     fields = fields_of(message.text)
     offer_id = fields.get("offer_id", "")
-    consent = fields.get("cross_asst_consent_ref") or fields.get("consent_ref", "")
+    consent = fields.get("consent_ref") or fields.get("cross_asst_consent_ref", "")
     offer = _our_offer(chat, agent, offer_id) if offer_id else {}
     slot = fields.get("slot_id") or offer.get("slot_id", "")
     facility = fields.get("facility") or offer.get("facility", "")
@@ -1620,7 +1620,7 @@ def _booking_of(chat: list[Message], agent: str, slot_id: str) -> tuple[str, str
         fields = fields_of(row.text)
         if "confirm" in words(row.text) and row.sender not in (LEDGER, agent):
             sender = row.sender
-            consent = fields.get("cross_asst_consent_ref") or fields.get("consent_ref") or consent
+            consent = fields.get("consent_ref") or fields.get("cross_asst_consent_ref") or consent
             number = fields.get("prescription_number") or number
         if row.sender == agent and "hold" in words(row.text):
             consent = fields.get("consent_ref", consent)
