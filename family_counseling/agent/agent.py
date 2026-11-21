@@ -221,6 +221,15 @@ def _when(value: str) -> datetime | None:
     return parsed
 
 
+def _when_loose(value: str) -> datetime | None:
+    """Come ``_when``, ma una data ISO senza fuso (formato MACH-1.1/1.2 tra squadre) vale
+    come ora di agenda UTC, la stessa scala del Ledger."""
+    at = _when(value)
+    if at is None and value and "T" in value:
+        at = _when(value + "+00:00")
+    return at
+
+
 def _citizen(chat: list[Message]) -> str | None:
     for row in chat:
         if row.sender.startswith("citizen:"):
@@ -379,6 +388,8 @@ def _speaks(doctor_id: str, lang: str, hint: str = "") -> bool:
 def _is_urgent_reserve(slot: dict[str, str], at: datetime | None = None) -> bool:
     val = slot.get("urgent_reserve", "").lower()
     if val in ("true", "1", "yes"):
+        return True
+    if slot.get("reserve", "").upper() == "U":
         return True
     slot_id = slot.get("slot_id", "")
     if slot_id.endswith("-0900") or "-09:00" in slot_id or "-0900-" in slot_id:
@@ -909,7 +920,7 @@ async def _on_confirm(
     agent = city.agent_id
     fields = fields_of(message.text)
     offer_id = fields.get("offer_id", "")
-    consent = fields.get("consent_ref") or fields.get("cross_asst_consent_ref", "")
+    consent = fields.get("cross_asst_consent_ref") or fields.get("consent_ref", "")
     offer = _our_offer(chat, agent, offer_id) if offer_id else {}
     slot = fields.get("slot_id") or offer.get("slot_id", "")
     facility = fields.get("facility") or offer.get("facility", "")
@@ -966,7 +977,38 @@ async def _forward_receipt(city: City, message: Message, chat: list[Message]) ->
     token = f"booking_id={booking_id}"
     if _we(chat, city.agent_id, token, to=citizen, word="booking.receipt"):
         return
+    # MACH-1.2 (fiducia): una ricevuta da chi non ha ricevuto un nostro confirm è una
+    # ricevuta fantasma; girarla al cittadino costerebbe -2 anche a noi.
+    if message.sender not in _OUR_AGENTS and not any(
+        row.sender == city.agent_id and row.recipient == message.sender and "confirm" in words(row.text)
+        for row in chat
+    ):
+        return
     await _say(city, citizen, f"booking.receipt booking_id={booking_id} ledger_ref={ledger_ref}")
+
+
+def _bc_offer_of_booking(chat: list[Message], partner: str, booking_id: str) -> str:
+    """MACH-1.2 livello 6: un cancel può portare solo booking_id. Si risale all'offer_id dalla
+    ricevuta che lo stesso partner ci aveva mandato (o dal confirm che gli avevamo girato)."""
+    if not booking_id or booking_id.lower() in {"none", "null", "-"}:
+        return ""
+    token = f"booking_id={booking_id}"
+    for row in reversed(chat):
+        if row.sender == partner and token in row.text.split() and "booking.receipt" in words(row.text):
+            fields = fields_of(row.text)
+            if fields.get("offer_id"):
+                return fields["offer_id"]
+            slot = fields.get("slot_id", "")
+            for sent in reversed(chat):
+                if slot and sent.recipient == partner and f"slot_id={slot}" in sent.text.split():
+                    found = fields_of(sent.text).get("offer_id", "")
+                    if found:
+                        return found
+    # Ricevuta senza offer_id né slot_id: l'ultimo confirm girato a quel partner.
+    for row in reversed(chat):
+        if row.recipient == partner and "confirm" in words(row.text):
+            return fields_of(row.text).get("offer_id", "")
+    return ""
 
 
 async def _partner_cancel(
@@ -974,6 +1016,8 @@ async def _partner_cancel(
 ) -> None:
     fields = fields_of(message.text)
     offer_id = fields.get("offer_id", "")
+    if offer_id.lower() in {"", "none", "null", "-"}:
+        offer_id = _bc_offer_of_booking(chat, message.sender, fields.get("booking_id", ""))
     citizen = _citizen(chat)
     if (
         offer_id
@@ -1301,7 +1345,7 @@ def _bc_partner_offer_line(
     citizen = _citizen(chat)
     now = _when((agenda or {}).get("agenda_now", ""))
     at_text = info.get("agenda_date") or info.get("at", "")
-    at = _when(at_text)
+    at = _when_loose(at_text)
     if not rx or not citizen or not now or not at:
         return None
     if rx.get("procedure") != procedure or rx.get("state", "issued") != "issued":
@@ -1326,8 +1370,12 @@ def _bc_partner_offer_line(
         return None
     if info.get("free", "1") == "0":
         return None
-    expiry = _when(expiry_text)
+    expiry = _when_loose(expiry_text)
     if expiry is None or expiry <= now:
+        return None
+    # MACH-1.2: offerta "rilassata" (rompe un vincolo). La carrozzina non si rilassa.
+    relaxed = info.get("relaxed", "").lower()
+    if relaxed == "wheelchair":
         return None
     # Mai inoltrare un medico che non parla la lingua del cittadino (o del genere sbagliato):
     # il cittadino lo rifiuterebbe e il percorso resterebbe aperto. doctor_lang del partner
@@ -1343,8 +1391,8 @@ def _bc_partner_offer_line(
     fields = [
         "offer", f"offer_id={offer_id}", f"slot_id={info['slot_id']}",
         f"doctor_id={info['doctor_id']}", f"facility={message.sender}",
-        f"procedure={procedure}", f"agenda_date={at_text}",
-        f"agenda_day={day}", f"expiry={expiry_text}",
+        f"procedure={procedure}", f"agenda_date={at.isoformat()}",
+        f"agenda_day={day}", f"expiry={expiry.isoformat()}",
         f"priority={priority}",
     ]
     if _is_urgent_reserve(info, at):
@@ -1395,6 +1443,16 @@ async def _fac_answer_partner(city: City, message: Message, chat: list[Message],
     if _we(chat, city.agent_id, tag, to=partner, word="offer") or _we(
         chat, city.agent_id, tag, to=partner, word="cancel"
     ):
+        # MACH-1.2 idempotenza: need.request ripetuta -> la stessa risposta, nessuno slot nuovo.
+        previous = [
+            row for row in chat
+            if row.sender == city.agent_id and row.recipient == partner
+            and tag in row.text.split() and ("offer" in words(row.text) or "cancel" in words(row.text))
+        ]
+        resent = sum(1 for row in chat if row.sender == partner and tag in row.text.split()
+                     and first_word(row.text) == "need.request")
+        if previous and resent > len(previous):
+            await _say(city, partner, previous[-1].text)
         return
     procedure = info.get("procedure", "")
     priority = info.get("priority") or None
@@ -1421,7 +1479,11 @@ async def _fac_answer_partner(city: City, message: Message, chat: list[Message],
         return
     lang = info.get("lang") or "it"  # senza lingua richiesta: tutti i medici parlano italiano
     gender = info.get("gender_preference") or info.get("gender")
-    slots = fitting(
+    if info.get("wheelchair", "").lower() in {"true", "1", "yes"} and role not in _FAC_WHEELCHAIR:
+        # Struttura non accessibile: la carrozzina non si rilassa.
+        await _say(city, partner, f"cancel reason=no_availability {tag}")
+        return
+    candidates = fitting(
         [line for line in world.splitlines() if "slot_id=" in line],
         now=now,
         priority=priority,
@@ -1429,11 +1491,22 @@ async def _fac_answer_partner(city: City, message: Message, chat: list[Message],
         gender=gender if gender in {"m", "f"} else None,
         facility=city.agent_id,
         procedure=procedure,
-    )[:_FAC_MAX_LINES]
+    )
+    deadline = _when_loose(info.get("deadline", ""))
+    if deadline is not None:
+        candidates = [s for s in candidates if (_when(s.get("at", "")) or deadline) <= deadline]
+    breaks = {s["slot_id"]: _fac_breaks(s, info) for s in candidates}
+    slots = [s for s in candidates if not breaks[s["slot_id"]]][:_FAC_MAX_LINES]
+    head: list[str] = []
     if not slots:
-        await _say(city, partner, f"cancel reason=no_availability {tag}")
-        return
-    rows = []
+        # MACH-1.2: nessuno slot con tutti i vincoli -> cancel e sotto fino a 3 offerte che ne
+        # rompono uno solo, marcate relaxed=. Decide il centro prenotazioni.
+        slots = [s for s in candidates if len(breaks[s["slot_id"]]) == 1][:3]
+        if not slots:
+            await _say(city, partner, f"cancel reason=no_availability {tag}")
+            return
+        head = [f"cancel reason=no_availability {tag}"]
+    rows = list(head)
     for slot in slots:
         doctor = slot["doctor_id"]
         spec = _DOCTORS.get(doctor.rsplit("-", 1)[-1])
@@ -1451,14 +1524,37 @@ async def _fac_answer_partner(city: City, message: Message, chat: list[Message],
         if priority:
             parts.append(f"priority={priority}")
         if _is_urgent_reserve(slot, _when(slot.get("at", ""))):
-            parts.append("urgent_reserve=true")
+            parts.append("urgent_reserve=true reserve=U")
         parts.append(tag)
         if role in _FAC_WHEELCHAIR:
             parts.append("wheelchair=true")
+        if breaks.get(slot["slot_id"]):
+            parts.append(f"relaxed={breaks[slot['slot_id']][0]}")
         rows.append(" ".join(parts))
+    if head:
+        rows.append("Con tutti i vincoli non c'è posto, questi sono i più vicini")
     while len(rows) > 1 and len("\n".join(rows)) > 1900:  # limite di 2000 caratteri per messaggio
         rows.pop()
     await _say(city, partner, "\n".join(rows))
+
+
+def _fac_breaks(slot: dict[str, str], info: dict[str, str]) -> list[str]:
+    """Vincoli MACH-1.2 (days, after, before) che lo slot non rispetta."""
+    at = _when(slot.get("at", ""))
+    out: list[str] = []
+    days = {part.strip().lower()[:3] for part in re.split(r"[/,;|]", info.get("days", "")) if part.strip()}
+    day = (slot.get("day") or "").lower()
+    if not day and at is not None:
+        day = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[at.weekday()]
+    if days and day and day not in days:
+        out.append("days")
+    after = _when_loose(info.get("after", ""))
+    before = _when_loose(info.get("before", ""))
+    if at is not None and after is not None and at < after:
+        out.append("after")
+    if at is not None and before is not None and at > before:
+        out.append("before")
+    return out
 
 
 # --- facility ----------------------------------------------------------------------------------
@@ -1524,7 +1620,7 @@ def _booking_of(chat: list[Message], agent: str, slot_id: str) -> tuple[str, str
         fields = fields_of(row.text)
         if "confirm" in words(row.text) and row.sender not in (LEDGER, agent):
             sender = row.sender
-            consent = fields.get("consent_ref") or fields.get("cross_asst_consent_ref") or consent
+            consent = fields.get("cross_asst_consent_ref") or fields.get("consent_ref") or consent
             number = fields.get("prescription_number") or number
         if row.sender == agent and "hold" in words(row.text):
             consent = fields.get("consent_ref", consent)
@@ -1662,6 +1758,8 @@ def _cancel_reason(chat: list[Message]) -> str:
     code = fields.get("code") or fields.get("reason") or ""
     if code in {"HELD", "ALREADY_HELD", "TAKEN", "SLOT_TAKEN", "CONFLICT"}:
         return f"slot_taken ledger_code={code}"
+    if code == "NO_CAPACITY" or "NO_CAPACITY" in text:
+        return "no_capacity ledger_code=NO_CAPACITY"
     return f"hold_refused ledger_code={code}" if code else "hold_refused"
 
 
