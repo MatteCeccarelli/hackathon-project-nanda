@@ -14,7 +14,7 @@ import os
 import re
 from collections import OrderedDict
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from city_sdk.city import LEDGER, CapError, City, Message, Need, OutOfScope, clinical, understood
@@ -86,7 +86,13 @@ async def main(need: Need, city: City) -> None:
     text = message.text or need.summary
     if clinical(text):
         raise OutOfScope()
-    case = await city.history(need_id=message.need_id)
+    need_id = message.need_id or getattr(need, "need_id", None)
+    try:
+        case = await city.history(need_id=need_id)
+    except CapError:
+        case = [message]
+    if not any(row.msg_id == message.msg_id for row in case):
+        case = [*case, message]
     await handle(role_of(), city, message, case)
 
 
@@ -346,17 +352,28 @@ def _has_agenda(chat: list[Message]) -> bool:
 
 
 def _rx_reply(chat: list[Message]) -> dict[str, str] | None:
-    """Risposta del Ledger sulla ricetta ATTUALE del cittadino (dopo un rinnovo cambia numero)."""
+    """Risposta del Ledger sulla ricetta ATTUALE del cittadino (dopo un rinnovo cambia numero).
+    In assenza temporanea di risposta del Ledger, usa come ripiego la prescrizione emessa dal medico di base."""
     number = _number(chat)
     rows = [row for row in chat if row.sender == LEDGER and first_word(row.text) == "prescription"]
     if not number:
-        return fields_of(rows[-1].text) if rows else None
-    matching = [row for row in rows if f"prescription_number={number}" in row.text.split()]
-    if matching:
-        return fields_of(matching[-1].text)
-    if any("prescription_number=" in row.text for row in rows):
-        return None  # il Ledger ha risposto solo per ricette precedenti: va chiesta questa
-    return fields_of(rows[-1].text) if rows else None
+        if rows:
+            return fields_of(rows[-1].text)
+    else:
+        matching = [row for row in rows if f"prescription_number={number}" in row.text.split()]
+        if matching:
+            return fields_of(matching[-1].text)
+        if any("prescription_number=" in row.text for row in rows):
+            return None  # il Ledger ha risposto solo per ricette precedenti: va chiesta questa
+        if rows:
+            return fields_of(rows[-1].text)
+    # Ripiego su prescrizione del medico di base nella chat se il Ledger tarda a rispondere
+    for row in reversed(chat):
+        if first_word(row.text) == "prescription" and row.sender != LEDGER:
+            fields = fields_of(row.text)
+            if not number or fields.get("prescription_number") == number:
+                return fields
+    return None
 
 
 def _has_procedure(chat: list[Message]) -> bool:
@@ -673,9 +690,19 @@ def _rejected_doctors(chat: list[Message], agent: str) -> set[str]:
 def _number(chat: list[Message]) -> str | None:
     for row in reversed(chat):
         if row.sender.startswith("citizen:"):
-            number = fields_of(row.text).get("prescription_number")
-            if number:
-                return number
+            fields = fields_of(row.text)
+            num = fields.get("prescription_number") or fields.get("rx") or fields.get("prescription")
+            if num:
+                return num
+    for row in reversed(chat):
+        if first_word(row.text) in {"prescription", "prescribed"}:
+            num = fields_of(row.text).get("prescription_number")
+            if num:
+                return num
+    for row in reversed(chat):
+        num = fields_of(row.text).get("prescription_number")
+        if num and num not in {"none", "null"}:
+            return num
     return None
 
 
@@ -925,7 +952,7 @@ class _Sent:
     citizen drop all offers, so ``again`` holds only what was re-sent for ``trigger``.
     """
 
-    __slots__ = ("offers", "trigger", "again", "retried", "waiting_list")
+    __slots__ = ("offers", "trigger", "again", "retried", "waiting_list", "searching_note")
 
     def __init__(self) -> None:
         self.offers: set[str] = set()
@@ -933,6 +960,7 @@ class _Sent:
         self.trigger = ""
         self.again: set[str] = set()
         self.waiting_list = False
+        self.searching_note = False
 
 
 # Every Ledger or citizen message opens its own turn, and turns of one need run at the same
@@ -987,13 +1015,16 @@ async def _desk(
             _LOG.info("care.partner.no_availability", extra={"partner": message.sender, "request_id": req_id})
             status = _bc_partner_status([*chat, message], city.agent_id, req_id)
             pending = [p for p, s in status.items() if s == "pending"]
+            offered = [p for p, s in status.items() if s == "offered"]
             citizen = _citizen(chat)
-            if status and not pending and citizen and _bc_open_partner_offers(chat, city.agent_id, citizen) == 0:
+            if status and not pending and not offered and citizen and _bc_open_partner_offers(chat, city.agent_id, citizen) == 0:
                 offer_id = f"wl-{message.need_id or req_id}"
-                if not _we(chat, city.agent_id, f"offer_id={offer_id}", to=citizen, word="offer"):
+                sent = _sent(message.need_id or req_id)
+                if not sent.waiting_list and not _we(chat, city.agent_id, f"offer_id={offer_id}", to=citizen, word="offer"):
                     note = _BC_WAITLIST_EN if _lang(chat) != "it" else _BC_WAITLIST_IT
                     if await _say(city, citizen, f"offer offer_id={offer_id} waiting_list=true\n{note}"):
-                        _sent(message.need_id or req_id).waiting_list = True
+                        sent.waiting_list = True
+                        sent.offers.add(offer_id)
             return
         if message.sender.startswith("citizen:"):
             if first_word(message.text) == "confirm":
@@ -1083,6 +1114,14 @@ async def _advance(
     gate.turns += 1
     try:
         async with gate.lock:
+            try:
+                fresh = await city.history(need_id=message.need_id)
+                if fresh:
+                    chat = fresh
+            except CapError:
+                pass
+            if all(row.msg_id != message.msg_id for row in chat):
+                chat = [*chat, message]
             await _advance_alone(city, message, chat, key, fixed=fixed, replacing=replacing)
     finally:
         gate.turns -= 1
@@ -1172,7 +1211,25 @@ async def _advance_alone(
             )
             continue
         if not procedure:
-            return
+            for row in reversed(chat):
+                if first_word(row.text) == "prescription" and row.sender != LEDGER:
+                    procedure = fields_of(row.text).get("procedure")
+                    if procedure:
+                        break
+            if not procedure:
+                for row in reversed(chat):
+                    if row.sender.startswith("citizen:"):
+                        procedure = fields_of(row.text).get("procedure")
+                        if procedure:
+                            break
+            if not procedure:
+                return
+        if not priority:
+            for row in reversed(chat):
+                if first_word(row.text) == "prescription" and row.sender != LEDGER:
+                    priority = fields_of(row.text).get("priority")
+                    if priority:
+                        break
         state = None if reply is None else reply.get("state")
         if fixed is None and _rx_expired(chat, reply, None):
             # Ricetta scaduta (stato o rifiuto del Ledger): si rimanda al medico di base.
@@ -1189,7 +1246,7 @@ async def _advance_alone(
         if now is not None and (world is not None or retry):
             break
         if _pass == 2:
-            return
+            break
         if now is None and not _exact(chat, agent, "agenda"):
             await _say(city, LEDGER, "agenda")
         if world is None and not _asked(chat, agent, procedure, 1):
@@ -1200,15 +1257,18 @@ async def _advance_alone(
             chat,
             lambda rows: _has_agenda(rows) and _latest_slots(rows) is not None,
         )
-    else:
-        return
-    if now is None or (world is None and not retry):
-        return
+    if now is None:
+        for row in reversed(chat):
+            if hasattr(row, "sent_at") and row.sent_at:
+                now = _when_loose(row.sent_at)
+                if now:
+                    break
+        if now is None:
+            now = datetime.now(timezone.utc)
     if fixed is None and _rx_expired(chat, _rx_reply(chat), now):
         # Regola P1: la ricetta ha piu' di 2 giorni di agenda. Prenotarla costerebbe -1.
         await _bc_ask_renewal(city, chat, citizen, _number(chat))
         return
-    retry_page = 1
     rejected_doctors = _rejected_doctors(chat, agent) if fixed is None else set()
     # A cancel drops every offer the citizen was holding, so the ones still free are sent again,
     # once per cancel: a second turn for the same cancel or refusal does not repeat them.
@@ -1221,41 +1281,52 @@ async def _advance_alone(
         taken = _withdrawn(chat, agent) | sent.again
     else:
         taken = _offered(chat, agent) | sent.offers
+    current_page = 1
+    chosen = []
     while True:
-        late = _late_page(chat, agent, retry_page) if retry else None
+        if world is not None and not (retry and current_page > 1):
+            chosen = [
+                slot
+                for slot in fitting(
+                    [line for line in world.splitlines() if "slot_id=" in line],
+                    now=now,
+                    priority=priority,
+                    lang=_lang(chat),
+                    gender=_gender(chat),
+                    facility=agent if fixed == "CONS-GIN" else None,
+                    procedure=procedure,
+                )
+                if slot.get("slot_id") not in taken and slot.get("doctor_id") not in rejected_doctors
+            ]
+            chosen = _bc_by_comfort(chosen, chat)
+            if chosen:
+                break
+            page, pages = _page(world)
+            if current_page >= min(pages, _MAX_PAGE):
+                break
+            next_page = current_page + 1
+        else:
+            next_page = current_page
+
+        late = _late_page(chat, agent, next_page) if retry else None
         if late is not None:
             world = late.text
-        elif retry:
+            current_page = next_page
+        else:
             seen = {row.msg_id for row in chat}
-            if not await _say(city, LEDGER, f"world procedure={procedure} page={retry_page}"):
-                return
+            if not await _say(city, LEDGER, f"world procedure={procedure} page={next_page}"):
+                break
             def fresh_page(rows: list[Message]) -> Message | None:
                 return next((row for row in reversed(rows) if row.msg_id not in seen
                              and row.sender == LEDGER and first_word(row.text) == "slots"
-                             and _page(row.text)[0] == retry_page), None)
+                             and _page(row.text)[0] == next_page), None)
 
             chat = await _until(city, message.need_id, chat, lambda rows: fresh_page(rows) is not None)
             page_reply = fresh_page(chat)
             if page_reply is None or _ledger(chat, "committed") is not None:
-                return
+                break
             world = page_reply.text
-        chosen = [
-            slot
-            for slot in fitting(
-                [line for line in world.splitlines() if "slot_id=" in line],
-                now=now,
-                priority=priority,
-                lang=_lang(chat),
-                gender=_gender(chat),
-                facility=agent if fixed == "CONS-GIN" else None,
-                procedure=procedure,
-            )
-            if slot.get("slot_id") not in taken and slot.get("doctor_id") not in rejected_doctors
-        ]
-        chosen = _bc_by_comfort(chosen, chat)
-        if not retry or chosen or retry_page >= min(_page(world)[1], _MAX_PAGE):
-            break
-        retry_page += 1
+            current_page = next_page
     if chosen:
         lang = _lang(chat)
         slots_to_offer = chosen[:3]
@@ -1272,15 +1343,6 @@ async def _advance_alone(
                 sent.offers.add(s["slot_id"])
                 if replacing:
                     sent.again.add(s["slot_id"])
-        return
-    if taken and not replacing:
-        return
-    page, pages = _page(world)
-    if page < pages and page < _MAX_PAGE:
-        # Comportamento base del template: si chiede la pagina successiva e la si
-        # elabora al turno in cui arriva la risposta del Ledger.
-        if not _asked(chat, agent, procedure, page + 1):
-            await _say(city, LEDGER, f"world procedure={procedure} page={page + 1}")
         return
 
     # Solo dopo l'ultima pagina locale: si cercano gli agenti di altre ASST.
@@ -1585,8 +1647,11 @@ async def _bc_discover(
     prev_crits = _bc_sent_criteria(chat, city.agent_id)
     criteria_updated = bool(prev_crits and current_crit not in prev_crits)
 
-    # Non aprire nuove ricerche se abbiamo gia' proposto uno slot valido e i criteri non sono cambiati.
-    if not retry_offer and not criteria_updated and (_offered(chat, city.agent_id) or _sent(key).offers):
+    # Non riaprire la ricerca se per gli stessi criteri e' gia' stata lanciata ed e' pendente
+    if not retry_offer and not criteria_updated and (
+        (_offered(chat, city.agent_id) or _sent(key).offers)
+        or (prev_crits and current_crit in prev_crits)
+    ):
         return
     try:
         peers = await city.find(service)
@@ -1645,20 +1710,30 @@ async def _bc_discover(
             if retry_offer:
                 _sent(key).retried.add(retry_offer)
             contacted += 1
-        # Con una lingua diversa dall'italiano il medico giusto sta in una sola ASST (es. urdu ->
-        # Nord): si chiede a tutti i partner trovati, altrimenti si resta a 12.
-        if contacted >= (_BC_MAX_PARTNERS_LANG if (lang and lang != "it") or gender else 12):
+        # Chiede a tutti i partner trovati per la procedura fino al limite massimo
+        if contacted >= _BC_MAX_PARTNERS_LANG:
             break
 
     # Il cittadino non resta senza risposta mentre aspettiamo i partner.
     citizen = _citizen(chat)
+    sent = _sent(key)
     if contacted and citizen:
         note = _BC_SEARCHING_EN if lang and lang != "it" else _BC_SEARCHING_IT
-        if not any(
+        if not sent.searching_note and not any(
             row.sender == city.agent_id and row.recipient == citizen and row.text == note
             for row in chat
         ):
-            await _say(city, citizen, note)
+            if await _say(city, citizen, note):
+                sent.searching_note = True
+    elif contacted == 0 and citizen:
+        # Nessun partner disponibile o contattabile per questa procedura (scarsità totale).
+        # Proponiamo la lista d'attesa prioritaria (alternativa rilassata S vuoto: 0 punti invece di -1).
+        offer_id = f"wl-{message.need_id or key}"
+        if not sent.waiting_list and not _we(chat, city.agent_id, f"offer_id={offer_id}", to=citizen, word="offer"):
+            note = _BC_WAITLIST_EN if lang and lang != "it" else _BC_WAITLIST_IT
+            if await _say(city, citizen, f"offer offer_id={offer_id} waiting_list=true\n{note}"):
+                sent.waiting_list = True
+                sent.offers.add(offer_id)
 
 
 _BC_MAX_PARTNERS_LANG = 40
@@ -1792,9 +1867,15 @@ async def _bc_waiting_list_fallback(
         else:
             return False
 
+    offered = [p for p, s in status.items() if s == "offered"]
+    if offered:
+        return False
+
     note = _BC_WAITLIST_EN if _lang(chat) != "it" else _BC_WAITLIST_IT
     if await _say(city, citizen, f"offer offer_id={offer_id} waiting_list=true\n{note}"):
-        _sent(key).waiting_list = True
+        sent = _sent(key)
+        sent.waiting_list = True
+        sent.offers.add(offer_id)
         return True
     return False
 
@@ -2137,10 +2218,7 @@ def _bc_open_partner_offers(chat: list[Message], agent: str, citizen: str) -> in
 def _bc_offer_pending(
     chat: list[Message], agent: str, citizen: str, sent_offers: set[str]
 ) -> bool:
-    """True se c'e' gia' un'offerta di slot attiva proposta al cittadino e non ancora confermata/annullata."""
-    real_sent = {s for s in sent_offers if not s.startswith("wl-")}
-    if real_sent and not any(row.sender == citizen and "cancel" in words(row.text) for row in chat):
-        return True
+    """True se l'ultimo messaggio verso il cittadino e' un'offerta in attesa di risposta."""
     for row in reversed(chat):
         if row.sender == citizen:
             return False
